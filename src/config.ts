@@ -6,8 +6,6 @@
  * single keys after profile selection.
  */
 
-import { charLen } from "./util";
-
 export type Profile = "small" | "large";
 export type RunMode = "parallel" | "sequential";
 
@@ -37,8 +35,6 @@ export interface Budgets {
 	selectMission: number;
 	/** `<notes>` / `<why>` decision notes per stage. */
 	notes: number;
-	/** Library lessons injected into solver runs (v2 hook; unused in v1). */
-	solverLessons: number;
 }
 
 export const PROFILES: Record<Profile, Budgets> = {
@@ -53,7 +49,6 @@ export const PROFILES: Record<Profile, Budgets> = {
 		reflectMission: 8_000,
 		selectMission: 16_000,
 		notes: 600,
-		solverLessons: 1_200,
 	},
 	large: {
 		agentsMd: 12_000,
@@ -66,7 +61,6 @@ export const PROFILES: Record<Profile, Budgets> = {
 		reflectMission: 24_000,
 		selectMission: 48_000,
 		notes: 2_000,
-		solverLessons: 4_000,
 	},
 };
 
@@ -103,10 +97,11 @@ export interface RsiSettings {
 	tools?: string;
 	/** Editor child runs are answer-only: no write/edit tools. */
 	editorTools?: string;
-	cleanMode?: boolean;
 	/** Refuse to run with uncommitted changes in the working tree (default true). */
 	requireClean?: boolean;
 	stageTimeoutMs?: number;
+	/** Old run directories kept under .pi/harness/runs (retention window). */
+	keepRuns?: number;
 }
 
 export interface RsiConfig {
@@ -126,10 +121,10 @@ export interface RsiConfig {
 	tools: string[];
 	editorTools: string[];
 	budgets: Budgets;
-	budgetOverrides: Partial<Record<keyof Budgets, number>>;
-	cleanMode: boolean;
 	requireClean: boolean;
 	stageTimeoutMs: number;
+	/** Run directories kept under `.pi/harness/runs` (see src/retention.ts). */
+	keepRuns: number;
 	/** PI_RSI_FAKE=1 — deterministic editor/probe, zero model calls. */
 	fake: boolean;
 	/** PI_RSI_FAKE_SCENARIO — fake editor behaviour under test. */
@@ -141,16 +136,25 @@ export interface RsiConfig {
 const POSITIVE_INT = (n: unknown, fallback: number): number =>
 	typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 
+/** Upper bounds that keep a typo (`--k 100`) from spawning 400 rollouts. */
+export const MAX_K = 8;
+export const MAX_PARALLEL = 8;
+
+export function clampK(n: number): number {
+	return Math.min(MAX_K, Math.max(1, POSITIVE_INT(n, 1)));
+}
+
+export function clampParallel(n: number): number {
+	return Math.min(MAX_PARALLEL, Math.max(1, POSITIVE_INT(n, 1)));
+}
+
 export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env): RsiConfig {
 	const s = (raw ?? {}) as RsiSettings;
 	const profile: Profile = s.profile === "large" ? "large" : "small";
 	const budgets: Budgets = { ...PROFILES[profile] };
-
-	const overrides: Partial<Record<keyof Budgets, number>> = {};
 	if (s.budgets && typeof s.budgets === "object") {
 		for (const [key, value] of Object.entries(s.budgets as Record<string, unknown>)) {
 			if (key in budgets && typeof value === "number" && Number.isFinite(value) && value > 0) {
-				overrides[key as keyof Budgets] = Math.floor(value);
 				budgets[key as keyof Budgets] = Math.floor(value);
 			}
 		}
@@ -163,7 +167,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env
 
 	return {
 		profile,
-		k: POSITIVE_INT(s.k, 1),
+		k: clampK(POSITIVE_INT(s.k, 1)),
 		mode: s.mode === "sequential" ? "sequential" : "parallel",
 		editorModel: typeof s.editorModel === "string" && s.editorModel.length > 0 ? s.editorModel : null,
 		solverModel: typeof s.solverModel === "string" && s.solverModel.length > 0 ? s.solverModel : null,
@@ -171,17 +175,17 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env
 		verifier: typeof s.verifier === "string" && s.verifier.trim().length > 0 ? s.verifier.trim() : null,
 		confirmAdopt: s.confirmAdopt !== false,
 		maxUsd: envMaxUsdOk ? (envMaxUsd as number) : POSITIVE_INT(s.maxUsd, 2),
-		maxParallel: Math.max(1, POSITIVE_INT(s.maxParallel, 2)),
+		maxParallel: clampParallel(POSITIVE_INT(s.maxParallel, 2)),
 		libraryDir: typeof s.libraryDir === "string" && s.libraryDir ? s.libraryDir : ".pi/harness/library",
 		worktreeRoot: typeof s.worktreeRoot === "string" && s.worktreeRoot ? s.worktreeRoot : ".pi/harness/worktrees",
-		forbiddenGlobs: Array.isArray(s.forbiddenGlobs) && s.forbiddenGlobs.length > 0 ? s.forbiddenGlobs : DEFAULT_FORBIDDEN_GLOBS,
+		forbiddenGlobs:
+			Array.isArray(s.forbiddenGlobs) && s.forbiddenGlobs.length > 0 ? s.forbiddenGlobs : DEFAULT_FORBIDDEN_GLOBS,
 		tools: splitTools(s.tools, "read,bash,edit,write,grep,find,ls"),
 		editorTools: splitTools(s.editorTools, "read,grep,find,ls"),
 		budgets,
-		budgetOverrides: overrides,
-		cleanMode: s.cleanMode === true,
 		requireClean: s.requireClean !== false,
 		stageTimeoutMs: POSITIVE_INT(s.stageTimeoutMs, 600_000),
+		keepRuns: POSITIVE_INT(s.keepRuns, 20),
 		fake,
 		fakeScenario:
 			env.PI_RSI_FAKE_SCENARIO === "invalid-first"
@@ -208,13 +212,4 @@ export function describeConfig(cfg: RsiConfig): string {
 		`profile=${cfg.profile} k=${cfg.k} mode=${cfg.mode} fake=${cfg.fake ? "1" : "0"} ` +
 		`maxUsd=${spend} confirmAdopt=${cfg.confirmAdopt ? "1" : "0"}`
 	);
-}
-
-/** Budget usage report line: `propose 12431/16000`. */
-export function budgetLine(label: string, used: number | undefined, budget: number): string {
-	return used === undefined ? `${label}: not run (budget ${budget})` : `${label} ${used}/${budget}${used > budget ? " OVER" : ""}`;
-}
-
-export function charCount(s: string): number {
-	return charLen(s);
 }

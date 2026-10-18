@@ -1,4 +1,8 @@
 node_modules/
-.pi/harness/
+# Transient run evidence + sandboxes + the cross-process run lock.
+# `.pi/harness/library/` (learned experience) is meant to be versioned.
+.pi/harness/runs/
+.pi/harness/worktrees/
+.pi/harness/run.lock
 *.log
 dist/

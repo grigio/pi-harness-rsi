@@ -45,7 +45,7 @@ export interface LedgerFile {
 	budgetsUsed: Record<string, number>;
 	/** Mean line-Jaccard across composed candidates (mode-collapse detector). */
 	diversity: number | null;
-	outcome: "running" | "probed" | "adopted" | "pending" | "fell_back" | "aborted_budget" | "error";
+	outcome: "running" | "probed" | "adopted" | "pending" | "fell_back" | "aborted_budget" | "aborted" | "error";
 	chosen: string | null;
 	adopted: boolean;
 	notes: string[];
@@ -56,7 +56,12 @@ export function ledgerPath(runDir: string): string {
 	return join(runDir, "ledger.json");
 }
 
-export function newLedger(runId: string, task: string, domain: string, cfg: Pick<RsiConfig, "k" | "mode" | "profile">): LedgerFile {
+export function newLedger(
+	runId: string,
+	task: string,
+	domain: string,
+	cfg: Pick<RsiConfig, "k" | "mode" | "profile">,
+): LedgerFile {
 	return {
 		runId,
 		task,
@@ -166,7 +171,9 @@ export function renderStatus(input: StatusInput): string {
 			`tripwire: ${ledger.counters.tripwire}  editor_errors: ${ledger.counters.editorErrors}`,
 	);
 	lines.push(`diversity: ${diversityText(ledger.diversity, ledger.k)}`);
-	lines.push(`outcome: ${ledger.outcome}${ledger.chosen ? `  chosen: ${ledger.chosen}` : ""}${ledger.adopted ? "  adopted" : ""}`);
+	lines.push(
+		`outcome: ${ledger.outcome}${ledger.chosen ? `  chosen: ${ledger.chosen}` : ""}${ledger.adopted ? "  adopted" : ""}`,
+	);
 
 	const used = { ...ledger.budgetsUsed, ...(input.budgetsUsed ?? {}) };
 	const rows = budgetRows(used, cfg);

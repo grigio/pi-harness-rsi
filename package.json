@@ -4,13 +4,23 @@
 	"description": "pi extension for harness self-improvement (Harness²-style Propose–Probe–Compose) with enforced context economy: every artifact entering a model context is budgeted.",
 	"type": "module",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/grigio/pi-harness-rsi.git"
+	},
 	"keywords": ["pi-package", "pi-extension", "rsi", "harness", "self-improvement"],
+	"files": ["index.ts", "src", "skills", "README.md", "LICENSE"],
+	"exports": {
+		".": "./index.ts"
+	},
 	"pi": {
 		"extensions": ["./index.ts"]
 	},
 	"scripts": {
 		"test": "bun test",
-		"typecheck": "bunx tsc -p tsconfig.json"
+		"typecheck": "bunx tsc -p tsconfig.json",
+		"lint": "biome check index.ts src test",
+		"format": "biome check --write index.ts src test"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
@@ -19,6 +29,7 @@
 		"bun": ">=1.1.0"
 	},
 	"devDependencies": {
+		"@biomejs/biome": "^2.5.15",
 		"@types/bun": "^1.4.3"
 	}
 }

@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config";
-import { runLoop, runReferenceProbes, statusOfRun, type LoopReport } from "../src/loop";
-import { loadLedger, countRP, newLedger, addEntry, assertIdentity } from "../src/ledger";
+import { addEntry, assertIdentity, countRP, loadLedger, newLedger } from "../src/ledger";
+import { heldRunLock, lockPath } from "../src/lock";
+import { type LoopReport, runLoop, runReferenceProbes, statusOfRun } from "../src/loop";
 
 function makeCwd(): string {
 	const dir = mkdtempSync(join(tmpdir(), "rsi-loop-"));
@@ -73,6 +74,9 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		expect(selection.trivial).toBe(true);
 		expect(selection.why).toContain("k=1");
 
+		// the cross-process lock is released when the run closes
+		expect(heldRunLock(cwd)).toBeUndefined();
+
 		// status renders the identity line
 		const status = statusOfRun({ cwd, runId: "fake-happy", cfg: fakeCfg() });
 		expect(status.ok).toBe(true);
@@ -94,7 +98,10 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		expect(ledger?.counters.fellBack).toBe(0); // the retry succeeded — no fallback
 		expect(report.notes.join("\n")).toContain("validation failed (attempt 1/2)"); // verbatim retry feedback path
 		// the retry mission carries the validator's own words (P3)
-		const retryMission = readFileSync(join(cwd, ".pi", "harness", "runs", "fake-retry", "missions", "propose-inv0-a1.md"), "utf8");
+		const retryMission = readFileSync(
+			join(cwd, ".pi", "harness", "runs", "fake-retry", "missions", "propose-inv0-a1.md"),
+			"utf8",
+		);
 		expect(retryMission).toContain("validator feedback (fix exactly this, nothing else)");
 		expect(retryMission).toMatch(/traversal|escape/);
 	}, 60_000);
@@ -154,11 +161,34 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		});
 		expect(report.outcome).toBe("probed");
 		expect(report.chosen).toBeNull();
-		expect(countRP(loadLedger(join(cwd, ".pi", "harness", "runs", "fake-probe"))!)).toEqual({ R: 1, P: 0 });
+		const probeLedger = loadLedger(join(cwd, ".pi", "harness", "runs", "fake-probe"));
+		expect(probeLedger).toBeDefined();
+		if (!probeLedger) throw new Error("fake-probe ledger missing");
+		expect(countRP(probeLedger)).toEqual({ R: 1, P: 0 });
 		const status = statusOfRun({ cwd, runId: "fake-probe", cfg: fakeCfg() });
 		expect(status.ok).toBe(true);
 		expect(status.text).toContain("probe-only run");
 	}, 60_000);
+
+	test("a foreign live lock refuses to start a run (no concurrent runs)", async () => {
+		const cwd = makeCwd();
+		mkdirSync(join(cwd, ".pi", "harness"), { recursive: true });
+		writeFileSync(
+			lockPath(cwd),
+			JSON.stringify({ pid: process.pid, runId: "foreign-run", startedAt: new Date().toISOString(), host: "x" }),
+		);
+		await expect(
+			runLoop({
+				cfg: fakeCfg(),
+				cwd,
+				task: "should never start",
+				domain: "demo",
+				force: true,
+				runId: "locked-out",
+				io: { log: () => {}, confirmAdoption: async () => true },
+			}),
+		).rejects.toThrow(/in flight/);
+	});
 });
 
 test("ledger identity math: R=4k, P=3k, selection/reflection uncounted", () => {

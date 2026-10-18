@@ -10,8 +10,8 @@
 
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
+import { type Surface, writeSurface } from "./surface";
 import { charLen, exists, listFiles, readTextIf, sanitizeSegment, slugify, writeText } from "./util";
-import { writeSurface, type Surface } from "./surface";
 
 /** Fixed lesson caps (not profile-dependent — they are small on purpose). */
 export const LESSON_CAPS = { cue: 200, lesson: 600, evidence: 400 } as const;
@@ -24,6 +24,8 @@ export interface Experience {
 	task?: string;
 	adoptedAt?: string;
 	label?: string;
+	/** Set when a newer same-cue lesson replaced this one (`by <slug> (<date>)`). */
+	superseded?: string;
 }
 
 export interface EntryInfo {
@@ -31,6 +33,7 @@ export interface EntryInfo {
 	cue: string;
 	lesson: string;
 	adoptedAt?: string;
+	superseded?: string;
 }
 
 export function libraryRoot(repoRoot: string, cfg: Pick<RsiConfig, "libraryDir">): string {
@@ -41,7 +44,12 @@ export function domainDir(repoRoot: string, cfg: Pick<RsiConfig, "libraryDir">, 
 	return join(libraryRoot(repoRoot, cfg), sanitizeSegment(domain));
 }
 
-export function entryDir(repoRoot: string, cfg: Pick<RsiConfig, "libraryDir">, domain: string, taskSlug: string): string {
+export function entryDir(
+	repoRoot: string,
+	cfg: Pick<RsiConfig, "libraryDir">,
+	domain: string,
+	taskSlug: string,
+): string {
 	return join(domainDir(repoRoot, cfg, domain), slugify(taskSlug));
 }
 
@@ -67,9 +75,12 @@ export function validateExperience(exp: Partial<Experience>): LessonValidation {
 	if (!lesson) errors.push("lesson is empty — nothing to teach the next task");
 	if (!evidence) errors.push("evidence is empty — a lesson without evidence is not transferable");
 	if (charLen(cue) > LESSON_CAPS.cue) errors.push(`cue is ${charLen(cue)} chars, over ${LESSON_CAPS.cue}`);
-	if (charLen(lesson) > LESSON_CAPS.lesson) errors.push(`lesson is ${charLen(lesson)} chars, over ${LESSON_CAPS.lesson}`);
-	if (charLen(evidence) > LESSON_CAPS.evidence) errors.push(`evidence is ${charLen(evidence)} chars, over ${LESSON_CAPS.evidence}`);
-	if (!["low", "medium", "high"].includes(confidence)) errors.push(`confidence "${confidence}" is not one of low|medium|high`);
+	if (charLen(lesson) > LESSON_CAPS.lesson)
+		errors.push(`lesson is ${charLen(lesson)} chars, over ${LESSON_CAPS.lesson}`);
+	if (charLen(evidence) > LESSON_CAPS.evidence)
+		errors.push(`evidence is ${charLen(evidence)} chars, over ${LESSON_CAPS.evidence}`);
+	if (!["low", "medium", "high"].includes(confidence))
+		errors.push(`confidence "${confidence}" is not one of low|medium|high`);
 
 	if (errors.length > 0) return { ok: false, errors };
 	return { ok: true, errors: [], value: { cue, lesson, evidence, confidence } };
@@ -89,6 +100,7 @@ export function writeExperience(dir: string, exp: Experience): void {
 		...(exp.task ? [`task: ${oneLine(exp.task)}`] : []),
 		...(exp.adoptedAt ? [`adopted: ${exp.adoptedAt}`] : []),
 		...(exp.label ? [`label: ${oneLine(exp.label)}`] : []),
+		...(exp.superseded ? [`superseded: ${oneLine(exp.superseded)}`] : []),
 		"---",
 		"",
 		`# ${exp.task ?? "entry"}`,
@@ -112,15 +124,16 @@ export function readExperience(dir: string): Experience | undefined {
 		if (idx === -1) continue;
 		fields[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
 	}
-	if (!fields["cue"] || !fields["lesson"] || !fields["evidence"]) return undefined;
+	if (!fields.cue || !fields.lesson || !fields.evidence) return undefined;
 	return {
-		cue: fields["cue"],
-		lesson: fields["lesson"],
-		evidence: fields["evidence"],
-		confidence: fields["confidence"] ?? "medium",
-		task: fields["task"],
-		adoptedAt: fields["adopted"],
-		label: fields["label"],
+		cue: fields.cue,
+		lesson: fields.lesson,
+		evidence: fields.evidence,
+		confidence: fields.confidence ?? "medium",
+		task: fields.task,
+		adoptedAt: fields.adopted,
+		label: fields.label,
+		superseded: fields.superseded,
 	};
 }
 
@@ -161,7 +174,7 @@ export function listEntries(repoRoot: string, cfg: Pick<RsiConfig, "libraryDir">
 	for (const slug of slugs) {
 		const exp = readExperience(join(dir, slug));
 		if (!exp) continue;
-		out.push({ slug, cue: exp.cue, lesson: exp.lesson, adoptedAt: exp.adoptedAt });
+		out.push({ slug, cue: exp.cue, lesson: exp.lesson, adoptedAt: exp.adoptedAt, superseded: exp.superseded });
 	}
 	return out.sort((a, b) => (a.adoptedAt ?? "").localeCompare(b.adoptedAt ?? ""));
 }
@@ -174,7 +187,12 @@ export function regenerateIndex(repoRoot: string, cfg: Pick<RsiConfig, "libraryD
 		"",
 		`${entries.length} adopted entr${entries.length === 1 ? "y" : "ies"} — regenerate with /rsi-library`,
 		"",
-		...entries.map((e) => `- **${e.slug}** — ${e.cue} → ${e.lesson}${e.adoptedAt ? ` (${e.adoptedAt})` : ""}`),
+		...entries.map(
+			(e) =>
+				`- **${e.slug}** — ${e.cue} → ${e.lesson}${e.adoptedAt ? ` (${e.adoptedAt})` : ""}${
+					e.superseded ? ` — **superseded** ${e.superseded}` : ""
+				}`,
+		),
 		"",
 	];
 	const text = lines.join("\n");
@@ -198,8 +216,10 @@ export function loadLessons(
 	max = 3,
 ): { index?: string; lessons: string[] } {
 	const index = readIndex(repoRoot, cfg, domain);
-	const entries = listEntries(repoRoot, cfg, domain);
-	if (entries.length === 0) return { lessons: [] };
+	// Superseded lessons are kept on disk for auditability but never served:
+	// retrieval must not feed the editor a stale contradiction.
+	const entries = listEntries(repoRoot, cfg, domain).filter((e) => !e.superseded);
+	if (entries.length === 0) return { index, lessons: [] };
 
 	const tokens = new Set(
 		task
@@ -228,13 +248,62 @@ export function loadLessons(
 }
 
 export function renderLesson(slug: string, exp: Experience): string {
-	return [
+	const lines = [
 		`### ${slug}`,
 		`path: ${slug}/EXPERIENCE.md`,
 		`cue: ${exp.cue}`,
 		`lesson: ${exp.lesson}`,
 		`evidence: ${exp.evidence} (confidence: ${exp.confidence})`,
-	].join("\n");
+	];
+	// Freshness signal (README “retrieval with staleness”): the editor weighs
+	// a dated lesson differently from an undated one. Costs ~14 chars per lesson.
+	if (exp.adoptedAt) lines.push(`adopted: ${exp.adoptedAt}`);
+	return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Temporal supersession
+// ---------------------------------------------------------------------------
+
+/** Cue tokens for overlap scoring (lowercase, >2 chars). */
+export function cueTokens(cue: string): Set<string> {
+	return new Set(
+		cue
+			.toLowerCase()
+			.split(/[^a-z0-9]+/)
+			.filter((t) => t.length > 2),
+	);
+}
+
+/**
+ * Mark older same-domain entries whose cue describes the same trigger as the
+ * lesson just written ("this fact replaced that one"). Conservative by design:
+ * ≥2 shared cue tokens *and* ≥50 % overlap of the smaller cue, never the entry
+ * just written, never an already-superseded entry. Marked entries keep their
+ * EXPERIENCE.md (auditability) but stop entering missions. The caller owns
+ * `regenerateIndex()` afterwards.
+ */
+export function markSupersededEntries(
+	repoRoot: string,
+	cfg: Pick<RsiConfig, "libraryDir">,
+	opts: { domain: string; slug: string; cue: string },
+): string[] {
+	const fresh = cueTokens(opts.cue);
+	if (fresh.size === 0) return [];
+	const marked: string[] = [];
+	for (const entry of listEntries(repoRoot, cfg, opts.domain)) {
+		if (entry.slug === opts.slug || entry.superseded) continue;
+		const old = cueTokens(entry.cue);
+		if (old.size === 0) continue;
+		const shared = [...fresh].filter((t) => old.has(t)).length;
+		if (shared < 2 || shared / Math.min(fresh.size, old.size) < 0.5) continue;
+		const dir = join(domainDir(repoRoot, cfg, opts.domain), entry.slug);
+		const exp = readExperience(dir);
+		if (!exp) continue;
+		writeExperience(dir, { ...exp, superseded: `by ${opts.slug} (${new Date().toISOString().slice(0, 10)})` });
+		marked.push(entry.slug);
+	}
+	return marked;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +362,6 @@ export interface RevertResult {
 export function revertSurface(
 	repoRoot: string,
 	cfg: Pick<RsiConfig, "libraryDir">,
-	live: Surface,
 	opts: { domain?: string; slug?: string },
 ): RevertResult {
 	const domains = opts.domain ? [sanitizeSegment(opts.domain)] : listDomains(repoRoot, cfg);
@@ -322,9 +390,9 @@ export function writeLessonIfValid(
 	repoRoot: string,
 	cfg: Pick<RsiConfig, "libraryDir">,
 	opts: { domain: string; slug: string; experience: Partial<Experience>; label?: string },
-): { written: boolean; errors: string[] } {
+): { written: boolean; errors: string[]; superseded: string[] } {
 	const validation = validateExperience(opts.experience);
-	if (!validation.ok || !validation.value) return { written: false, errors: validation.errors };
+	if (!validation.ok || !validation.value) return { written: false, errors: validation.errors, superseded: [] };
 	const dir = entryDir(repoRoot, cfg, opts.domain, opts.slug);
 	writeExperience(dir, {
 		...validation.value,
@@ -332,6 +400,11 @@ export function writeLessonIfValid(
 		adoptedAt: new Date().toISOString().slice(0, 10),
 		label: opts.label,
 	});
+	const superseded = markSupersededEntries(repoRoot, cfg, {
+		domain: opts.domain,
+		slug: opts.slug,
+		cue: validation.value.cue,
+	});
 	regenerateIndex(repoRoot, cfg, opts.domain);
-	return { written: true, errors: [] };
+	return { written: true, errors: [], superseded };
 }

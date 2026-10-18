@@ -17,57 +17,64 @@ import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { BudgetError, type MissionPart } from "./context";
 import {
-	ReplyParseError,
 	buildMission,
 	composeParts,
+	type EditorStage,
 	parseChoice,
 	parseEdits,
 	parseExperience,
 	proposeParts,
+	ReplyParseError,
 	reflectParts,
 	runEditor,
 	selectParts,
-	type EditorStage,
 } from "./editor";
-import { assertAdoptionAllowed, workingTreeStatus, DirtyTreeError, AdoptionGateError } from "./guard";
-import {
-	adoptSurface,
-	entryDir,
-	loadLessons,
-	readExperience,
-	regenerateIndex,
-	writeLessonIfValid,
-} from "./library";
+import type { FakeEditorContext } from "./fake";
+import { assertAdoptionAllowed, DirtyTreeError, workingTreeStatus } from "./guard";
 import {
 	addEntry,
 	assertIdentity,
-	countRP,
+	type IdentityReport,
+	type LedgerFile,
 	loadLedger,
 	newLedger,
 	pushNote,
 	renderStatus,
 	saveLedger,
 	totalUsd,
-	type IdentityReport,
-	type LedgerFile,
 } from "./ledger";
-import { runProbe, evidencePaths, type ProbeResult } from "./probe";
-import { buildPool, fallbackChoice, isTrivialSelection, renderCandidates, saveSelection, selectionSeed, type SelectionRecord } from "./selection";
+import { adoptSurface, loadLessons, regenerateIndex, writeLessonIfValid } from "./library";
+import { acquireRunLock, RunLockedError } from "./lock";
+import { type ProbeResult, runProbe } from "./probe";
+import { pruneRuns } from "./retention";
+import { latestRunId, runsDir } from "./runs";
+import {
+	buildPool,
+	fallbackChoice,
+	isTrivialSelection,
+	renderCandidates,
+	type SelectionRecord,
+	saveSelection,
+	selectionSeed,
+} from "./selection";
 import {
 	applyDelta,
 	diffSurface,
 	readSurface,
+	renderScriptReview,
+	type Surface,
+	type SurfaceDelta,
+	type SurfaceDiff,
 	surfaceFromJson,
 	surfaceToJson,
 	validate,
 	writeSurface,
-	type Surface,
-	type SurfaceDelta,
-	type SurfaceDiff,
 } from "./surface";
 import {
+	exists,
 	extractTag,
 	hash12,
+	jaccardLines,
 	listFiles,
 	mapLimit,
 	nowRunId,
@@ -75,14 +82,16 @@ import {
 	sanitizeSegment,
 	slugify,
 	writeText,
-	jaccardLines,
 } from "./util";
-import { ensureHarnessIgnored, prepareSandbox, type Sandbox } from "./worktree";
+import { type ActiveRun, beginRun, endRun, pushLiveNote, type RunKind, STOP_FILE, setStage } from "./watch";
+import { cleanupSandboxes, ensureHarnessIgnored, prepareSandbox, type Sandbox } from "./worktree";
 
 // __PART2__
 
+export type LogLevel = "info" | "warn" | "error" | "success";
+
 export interface LoopIO {
-	log(message: string, level?: "info" | "warn" | "error"): void;
+	log(message: string, level?: LogLevel): void;
 	/** Adoption gate (P6). Omit for headless/test runs — adoption then needs `/rsi-adopt`. */
 	confirmAdoption?(title: string, message: string): Promise<boolean>;
 }
@@ -129,38 +138,96 @@ interface RunContext {
 	domain: string;
 	errors: string[];
 	budgetsUsed: Record<string, number>;
+	/** Live registry entry (/rsi-watch) + merged abort signal (/rsi-stop). */
+	watch: ActiveRun;
+	signal: AbortSignal;
+	/** The live tree matched HEAD at run start (worktree sandboxes are safe);
+	 * otherwise probes copy the live tree so they measure exactly this surface. */
+	clean: boolean;
+	/** Releases the cross-process run lock; idempotent. */
+	releaseLock: () => void;
+}
+
+/**
+ * Register the run in the live registry and merge the caller's signal into the
+ * stop controller, so both `/rsi-stop` and `LoopOptions.signal` interrupt it.
+ */
+function attachWatch(
+	target: { runId: string; runDir: string; task: string; domain: string; kind: RunKind },
+	external?: AbortSignal,
+): { watch: ActiveRun; signal: AbortSignal } {
+	const run = beginRun(target);
+	if (external) {
+		if (external.aborted) run.controller.abort();
+		else external.addEventListener("abort", () => run.controller.abort(), { once: true });
+	}
+	return { watch: run, signal: run.controller.signal };
 }
 
 function createRun(opts: LoopOptions, outcome: Outcome = "running"): RunContext {
 	const runId = opts.runId ?? nowRunId(opts.task);
-	const runDir = join(opts.cwd, ".pi", "harness", "runs", runId);
-	ensureHarnessIgnored(opts.cwd);
-	const ledger = newLedger(runId, opts.task, sanitizeSegment(opts.domain), opts.cfg);
-	ledger.outcome = outcome;
-	const ctx: RunContext = {
-		runId,
-		runDir,
-		ledger,
-		io: opts.io ?? silent,
-		cfg: opts.cfg,
-		cwd: opts.cwd,
-		task: opts.task,
-		domain: sanitizeSegment(opts.domain),
-		errors: [],
-		budgetsUsed: {},
-	};
-	save(ctx);
-	writeText(join(runDir, "task.txt"), opts.task);
-	return ctx;
+	const lock = acquireRunLock(opts.cwd, runId);
+	if (!lock.ok) throw new RunLockedError(lock.holder);
+	let started = false;
+	try {
+		const pruned = pruneRuns(opts.cwd, { keepRuns: opts.cfg.keepRuns, protect: [runId] });
+		const runsRoot = join(opts.cwd, ".pi", "harness", "runs");
+		const runDir = join(runsRoot, runId);
+		ensureHarnessIgnored(opts.cwd);
+		const cleaned = cleanupSandboxes(opts.cwd, opts.cfg, { protect: [runId] });
+		const ledger = newLedger(runId, opts.task, sanitizeSegment(opts.domain), opts.cfg);
+		ledger.outcome = outcome;
+		const live = attachWatch(
+			{
+				runId,
+				runDir,
+				task: opts.task,
+				domain: sanitizeSegment(opts.domain),
+				kind: outcome === "probed" ? "probe" : "loop",
+			},
+			opts.signal,
+		);
+		started = true;
+		const ctx: RunContext = {
+			runId,
+			runDir,
+			ledger,
+			io: opts.io ?? silent,
+			cfg: opts.cfg,
+			cwd: opts.cwd,
+			task: opts.task,
+			domain: sanitizeSegment(opts.domain),
+			errors: [],
+			budgetsUsed: {},
+			watch: live.watch,
+			signal: live.signal,
+			clean: !workingTreeStatus(opts.cwd).dirty,
+			releaseLock: lock.release,
+		};
+		save(ctx);
+		writeText(join(runDir, "task.txt"), opts.task);
+		if (pruned.removed.length > 0) {
+			note(ctx, `retention: pruned ${pruned.removed.length} old run(s), keepRuns=${opts.cfg.keepRuns}`);
+		}
+		if (cleaned.dirs > 0) {
+			note(ctx, `cleanup: removed ${cleaned.dirs} stale sandbox dir(s) under the worktree root`);
+		}
+		return ctx;
+	} catch (err) {
+		if (started) endRun(runId);
+		lock.release();
+		throw err;
+	}
 }
 
 function save(ctx: RunContext): void {
 	saveLedger(ctx.runDir, ctx.ledger);
 }
 
-function note(ctx: RunContext, text: string): void {
+function note(ctx: RunContext, text: string, level: LogLevel = "info"): void {
 	pushNote(ctx.ledger, text);
-	ctx.io.log(text);
+	pushLiveNote(ctx.watch, text);
+	ctx.io.log(text, level);
 	save(ctx);
 }
 
@@ -174,10 +241,21 @@ function recordBudget(ctx: RunContext, stage: string, used: number): void {
 function outOfBudget(ctx: RunContext): boolean {
 	const spent = totalUsd(ctx.ledger);
 	if (spent >= ctx.cfg.maxUsd) {
-		note(ctx, `budget stop: spent ${spent.toFixed(4)} USD ≥ max ${ctx.cfg.maxUsd} — keeping the current surface`);
+		note(
+			ctx,
+			`budget stop: spent ${spent.toFixed(4)} USD ≥ max ${ctx.cfg.maxUsd} — keeping the current surface`,
+			"warn",
+		);
 		return true;
 	}
 	return false;
+}
+
+/** User interruption (`/rsi-stop`, or a `STOP` file from another session) wins over the budget check; both fail closed. */
+function stopOutcome(ctx: RunContext): Outcome | null {
+	if (ctx.signal.aborted || exists(join(ctx.runDir, STOP_FILE))) return "aborted";
+	if (outOfBudget(ctx)) return "aborted_budget";
+	return null;
 }
 
 function solverPrompt(task: string): string {
@@ -204,7 +282,12 @@ async function probeSurface(
 ): Promise<ProbeResult> {
 	const cfg = ctx.cfg;
 	const id = `${label}-${hash12(`${ctx.runId}:${label}`).slice(0, 8)}`;
-	const sandbox: Sandbox = prepareSandbox(ctx.cwd, cfg, { id, force: true, copySource: ctx.cwd });
+	setStage(ctx.watch, `probe ${label}`);
+	const sandbox: Sandbox = prepareSandbox(ctx.cwd, cfg, {
+		id,
+		forceCopy: !ctx.clean,
+		copySource: ctx.cwd,
+	});
 	try {
 		writeText(join(ctx.runDir, "surfaces", `${label}.json`), surfaceToJson(surface));
 		sandbox.stage(surface);
@@ -217,7 +300,7 @@ async function probeSurface(
 			signal: opts.signal,
 		});
 		addEntry(ctx.ledger, { kind: "rollout", label, usd: result.usd, attempts: 1, wallMs: result.wallMs });
-		if (!result.ok) note(ctx, `rollout ${label} exited ${result.exitCode}: ${result.error ?? "unknown error"}`);
+		if (!result.ok) note(ctx, `rollout ${label} exited ${result.exitCode}: ${result.error ?? "unknown error"}`, "warn");
 		save(ctx);
 		return result;
 	} finally {
@@ -226,19 +309,17 @@ async function probeSurface(
 }
 
 function diffText(label: string, diff: SurfaceDiff): string {
-	const changed = [...diff.added.map((p) => `+ ${p}`), ...diff.removed.map((p) => `- ${p}`), ...diff.modified.map((p) => `~ ${p}`)];
+	const changed = [
+		...diff.added.map((p) => `+ ${p}`),
+		...diff.removed.map((p) => `- ${p}`),
+		...diff.modified.map((p) => `~ ${p}`),
+	];
 	return [
 		`${label}: added ${diff.added.length}, removed ${diff.removed.length}, modified ${diff.modified.length}, ` +
 			`always-on Δ ${diff.alwaysOnDelta >= 0 ? "+" : ""}${diff.alwaysOnDelta} chars, surface Δ ` +
 			`${diff.charsDelta >= 0 ? "+" : ""}${diff.charsDelta} chars`,
 		...(changed.length > 0 ? changed.map((c) => `  ${c}`) : ["  (no file changes)"]),
 	].join("\n");
-}
-
-interface EditorAttemptFailure {
-	error: string;
-	attempts: number;
-	tripwire?: boolean;
 }
 
 interface ProposedCandidate {
@@ -263,57 +344,56 @@ interface ProposeArgs {
 	signal?: AbortSignal;
 }
 
-/** INV/DOM proposal with exactly one retry carrying the verbatim validator error. */
-async function proposeStage(ctx: RunContext, args: ProposeArgs): Promise<ProposedCandidate> {
+/**
+ * Shared editor stage body: assemble → run → parse → validate, with exactly
+ * one retry carrying the verbatim validator error, then fail closed to the base
+ * surface (P3). One ledger `session` entry per stage, so retries never inflate
+ * the `P = 3k` identity.
+ */
+async function runEditorStage(
+	ctx: RunContext,
+	args: {
+		label: string;
+		stage: EditorStage;
+		budgetStage: "propose" | "compose";
+		base: Surface;
+		ledgerLabel: string;
+		fake: Omit<FakeEditorContext, "attempt" | "scenario" | "validationError">;
+		buildParts: (info: { lastError: string; attempt: number }) => MissionPart[];
+		signal?: AbortSignal;
+	},
+): Promise<ProposedCandidate> {
 	const { cfg, runDir } = ctx;
-	const stage = args.lever;
-	const label = stage === "propose-inv" ? `inv${args.index}` : `dom${args.index}`;
+	const { label } = args;
 	let lastError = "";
 	let spentUsd = 0;
 	let attempts = 0;
-	const skillName = `${ctx.domain}-notes`;
 
 	for (let attempt = 0; attempt < 2; attempt++) {
-		if (outOfBudget(ctx)) break;
-		const inputs = {
-			task: ctx.task,
-			domain: ctx.domain,
-			surface: args.base,
-			evidence: args.evidence,
-			digests: [args.refDigest],
-			libraryIndex: args.library.index,
-			libraryLessons: args.library.lessons,
-			carry: attempt > 0 ? lastError : args.carry,
-		};
-		const parts = proposeParts(stage, inputs, cfg);
-		if (attempt > 0) {
-			parts.push({
-				name: "validator feedback (fix exactly this, nothing else)",
-				text: lastError,
-			});
-		}
+		if (ctx.signal.aborted || outOfBudget(ctx)) break;
+		const parts = args.buildParts({ lastError, attempt });
 
-		let mission;
+		let mission: ReturnType<typeof buildMission>;
 		try {
-			mission = buildMission(stage, "propose", parts, cfg, runDir, `${label}-a${attempt}`);
+			mission = buildMission(args.budgetStage, parts, cfg, runDir, `${label}-a${attempt}`);
 		} catch (err) {
 			if (err instanceof BudgetError) {
 				lastError = err.message;
-				note(ctx, `${label}: propose mission over budget — ${err.message}`);
+				note(ctx, `${label}: ${args.budgetStage} mission over budget — ${err.message}`, "warn");
 				break;
 			}
 			throw err;
 		}
-		recordBudget(ctx, "propose", mission.mission.used);
+		recordBudget(ctx, args.budgetStage, mission.mission.used);
 
 		const run = await runEditor({
-			stage,
+			stage: args.stage,
 			mission: mission.mission,
 			missionPath: mission.path,
 			runDir,
 			cfg,
 			attempt,
-			fake: { stage, domain: ctx.domain, skillName, baseAgents: args.base["AGENTS.md"] ?? "" },
+			fake: args.fake,
 			signal: args.signal,
 		});
 		// One ledger entry per *stage*: `attempts` records retries, so the
@@ -324,46 +404,81 @@ async function proposeStage(ctx: RunContext, args: ProposeArgs): Promise<Propose
 		if (!run.ok) {
 			ctx.ledger.counters.editorErrors++;
 			lastError = `editor run failed: ${run.error ?? "no reply"}`;
-			note(ctx, `${label}: ${lastError}`);
+			note(ctx, `${label}: ${lastError}`, "warn");
 			continue;
 		}
 
 		try {
 			const parsed = parseEdits(run.reply, cfg);
 			const candidate = applyDelta(args.base, parsed.delta);
-			const report = validate(candidate, cfg, { where: label });
+			// Delta-only validation: only problems this proposal *adds* block it.
+			const report = validate(candidate, cfg, { where: label, base: args.base });
 			if (report.errors.length > 0) {
 				lastError = report.errors.join("\n");
 				if (report.errors.some((e) => e.includes("tripwire") || e.includes("forbidden path"))) {
 					ctx.ledger.counters.tripwire++;
 				}
-				note(ctx, `${label}: validation failed (attempt ${attempt + 1}/2)`);
+				note(ctx, `${label}: validation failed (attempt ${attempt + 1}/2)`, "warn");
 				continue;
 			}
 			for (const warning of report.warnings) note(ctx, `${label}: ${warning}`);
 			writeText(join(runDir, "notes", `${label}.txt`), parsed.notes);
-			addEntry(ctx.ledger, { kind: "session", label: `propose-${label}`, usd: spentUsd, attempts, wallMs: run.wallMs });
+			addEntry(ctx.ledger, { kind: "session", label: args.ledgerLabel, usd: spentUsd, attempts, wallMs: run.wallMs });
 			save(ctx);
 			return { ok: true, surface: candidate, delta: parsed.delta, notes: parsed.notes, usd: run.usd };
 		} catch (err) {
 			if (err instanceof ReplyParseError) {
 				lastError = err.message;
-				note(ctx, `${label}: unparsable reply (attempt ${attempt + 1}/2)`);
+				note(ctx, `${label}: unparsable reply (attempt ${attempt + 1}/2)`, "warn");
 				continue;
 			}
 			lastError = (err as Error).message;
-			note(ctx, `${label}: ${lastError}`);
-			continue;
+			note(ctx, `${label}: ${lastError}`, "warn");
 		}
 	}
 
 	// Fail closed to the current surface (P3).
 	ctx.ledger.counters.keptBase++;
 	ctx.ledger.counters.fellBack++;
-	const failure = lastError || "editor produced no valid delta";
-	addEntry(ctx.ledger, { kind: "session", label: `propose-${label}`, usd: spentUsd, attempts, wallMs: attempts * 1 });
-	note(ctx, `${label}: fell back to the current surface — ${failure.slice(0, 200)}`);
+	const failure = lastError || `${args.budgetStage} produced no valid delta`;
+	addEntry(ctx.ledger, { kind: "session", label: args.ledgerLabel, usd: spentUsd, attempts, wallMs: attempts * 1 });
+	note(ctx, `${label}: fell back to the current surface — ${failure.slice(0, 200)}`, "warn");
 	return { ok: false, surface: args.base, delta: { files: [] }, notes: failure, usd: 0, failure };
+}
+
+/** INV/DOM proposal with exactly one retry carrying the verbatim validator error. */
+async function proposeStage(ctx: RunContext, args: ProposeArgs): Promise<ProposedCandidate> {
+	const stage = args.lever;
+	const label = stage === "propose-inv" ? `inv${args.index}` : `dom${args.index}`;
+	return runEditorStage(ctx, {
+		label,
+		stage,
+		budgetStage: "propose",
+		base: args.base,
+		ledgerLabel: `propose-${label}`,
+		signal: args.signal,
+		fake: { stage, domain: ctx.domain, skillName: `${ctx.domain}-notes`, baseAgents: args.base["AGENTS.md"] ?? "" },
+		buildParts: ({ lastError, attempt }) => {
+			const parts = proposeParts(
+				stage,
+				{
+					task: ctx.task,
+					domain: ctx.domain,
+					surface: args.base,
+					evidence: args.evidence,
+					digests: [args.refDigest],
+					libraryIndex: args.library.index,
+					libraryLessons: args.library.lessons,
+					carry: attempt > 0 ? lastError : args.carry,
+				},
+				ctx.cfg,
+			);
+			if (attempt > 0) {
+				parts.push({ name: "validator feedback (fix exactly this, nothing else)", text: lastError });
+			}
+			return parts;
+		},
+	});
 }
 
 interface ComposeArgs {
@@ -378,100 +493,57 @@ interface ComposeArgs {
 
 /** Compose one final surface from contrastive digests (never from full trajectories). */
 async function composeStage(ctx: RunContext, args: ComposeArgs): Promise<ProposedCandidate> {
-	const { cfg, runDir } = ctx;
+	const { runDir } = ctx;
 	const label = `final${args.index}`;
+	setStage(ctx.watch, `compose ${label}`);
 	const leverNames = ["inv", "dom"];
-	let spentUsd = 0;
-	let attempts = 0;
 
 	const contrast: string[] = [`=== reference ref${args.index} ===\n${args.refProbe.digest}`];
 	for (const [i, cand] of args.candidates.entries()) {
-		contrast.push(`=== candidate ${leverNames[i]}${args.index} (${i === 0 ? "procedure" : "practitioner knowledge"}) ===\n${cand.notes ? `notes: ${cand.notes}\n` : ""}${candidateDigest(cand, runDir, `${leverNames[i]}${args.index}`)}`);
-	}
-	const diffs = args.candidates.map((cand, i) => diffText(`${leverNames[i]}${args.index} vs current`, diffSurface(args.base, cand.surface)));
-	const decisionNotes = args.candidates.map((cand, i) => `[${leverNames[i]}${args.index}] ${cand.notes || "(no notes)"}`);
-
-	let lastError = "";
-	for (let attempt = 0; attempt < 2; attempt++) {
-		if (outOfBudget(ctx)) break;
-		const parts = composeParts(
-			{
-				task: ctx.task,
-				domain: ctx.domain,
-				surface: args.base,
-				evidence: diffs,
-				digests: [],
-				contrast,
-				decisionNotes,
-				libraryIndex: args.library.index,
-				libraryLessons: args.library.lessons,
-				carry: attempt > 0 ? lastError : args.carry,
-			},
-			cfg,
+		contrast.push(
+			`=== candidate ${leverNames[i]}${args.index} (${i === 0 ? "procedure" : "practitioner knowledge"}) ===\n${cand.notes ? `notes: ${cand.notes}\n` : ""}${candidateDigest(cand, runDir, `${leverNames[i]}${args.index}`)}`,
 		);
-		if (attempt > 0) parts.push({ name: "validator feedback (fix exactly this, nothing else)", text: lastError });
-
-		let mission;
-		try {
-			mission = buildMission("compose", "compose", parts, cfg, runDir, `${label}-a${attempt}`);
-		} catch (err) {
-			if (err instanceof BudgetError) {
-				lastError = err.message;
-				note(ctx, `${label}: compose mission over budget — ${err.message}`);
-				break;
-			}
-			throw err;
-		}
-		recordBudget(ctx, "compose", mission.mission.used);
-
-		const run = await runEditor({
-			stage: "compose",
-			mission: mission.mission,
-			missionPath: mission.path,
-			runDir,
-			cfg,
-			attempt,
-			fake: { stage: "compose", domain: ctx.domain, skillName: `${ctx.domain}-notes`, baseAgents: args.base["AGENTS.md"] ?? "" },
-			signal: args.signal,
-		});
-		attempts++;
-		spentUsd += run.usd;
-
-		if (!run.ok) {
-			ctx.ledger.counters.editorErrors++;
-			lastError = `editor run failed: ${run.error ?? "no reply"}`;
-			note(ctx, `${label}: ${lastError}`);
-			continue;
-		}
-		try {
-			const parsed = parseEdits(run.reply, cfg);
-			const candidate = applyDelta(args.base, parsed.delta);
-			const report = validate(candidate, cfg, { where: label });
-			if (report.errors.length > 0) {
-				lastError = report.errors.join("\n");
-				if (report.errors.some((e) => e.includes("tripwire") || e.includes("forbidden path"))) {
-					ctx.ledger.counters.tripwire++;
-				}
-				note(ctx, `${label}: validation failed (attempt ${attempt + 1}/2)`);
-				continue;
-			}
-			writeText(join(runDir, "notes", `${label}.txt`), parsed.notes);
-			addEntry(ctx.ledger, { kind: "session", label: `compose-${label}`, usd: spentUsd, attempts, wallMs: run.wallMs });
-			save(ctx);
-			return { ok: true, surface: candidate, delta: parsed.delta, notes: parsed.notes, usd: run.usd };
-		} catch (err) {
-			lastError = err instanceof ReplyParseError ? err.message : (err as Error).message;
-			note(ctx, `${label}: unparsable reply (attempt ${attempt + 1}/2)`);
-			continue;
-		}
 	}
+	const diffs = args.candidates.map((cand, i) =>
+		diffText(`${leverNames[i]}${args.index} vs current`, diffSurface(args.base, cand.surface)),
+	);
+	const decisionNotes = args.candidates.map(
+		(cand, i) => `[${leverNames[i]}${args.index}] ${cand.notes || "(no notes)"}`,
+	);
 
-	ctx.ledger.counters.keptBase++;
-	ctx.ledger.counters.fellBack++;
-	const failure = lastError || "compose produced no valid delta";
-	addEntry(ctx.ledger, { kind: "session", label: `compose-${label}`, usd: spentUsd, attempts, wallMs: attempts * 1 });
-	note(ctx, `${label}: fell back to the current surface — ${failure.slice(0, 200)}`);
-	return { ok: false, surface: args.base, delta: { files: [] }, notes: failure, usd: 0, failure };
+	return runEditorStage(ctx, {
+		label,
+		stage: "compose",
+		budgetStage: "compose",
+		base: args.base,
+		ledgerLabel: `compose-${label}`,
+		signal: args.signal,
+		fake: {
+			stage: "compose",
+			domain: ctx.domain,
+			skillName: `${ctx.domain}-notes`,
+			baseAgents: args.base["AGENTS.md"] ?? "",
+		},
+		buildParts: ({ lastError, attempt }) => {
+			const parts = composeParts(
+				{
+					task: ctx.task,
+					domain: ctx.domain,
+					surface: args.base,
+					evidence: diffs,
+					digests: [],
+					contrast,
+					decisionNotes,
+					libraryIndex: args.library.index,
+					libraryLessons: args.library.lessons,
+					carry: attempt > 0 ? lastError : args.carry,
+				},
+				ctx.cfg,
+			);
+			if (attempt > 0) parts.push({ name: "validator feedback (fix exactly this, nothing else)", text: lastError });
+			return parts;
+		},
+	});
 }
 
 /** Digests live on disk; the compose mission gets them by pointer (P2). */
@@ -485,9 +557,7 @@ function range(n: number): number[] {
 	return Array.from({ length: n }, (_, i) => i);
 }
 
-function evidenceFor(ctx: RunContext, index: number): string[] {
-	const paths = evidencePaths(ctx.runDir);
-	void paths;
+function evidenceFor(index: number): string[] {
 	return [`evidence/rollouts/ref${index}.jsonl`, `digests/ref${index}.md`];
 }
 
@@ -519,18 +589,23 @@ export async function runReferenceProbes(opts: LoopOptions): Promise<LoopReport>
 		const base = readSurface(opts.cwd, opts.cfg);
 		if (base["AGENTS.md"] === undefined) base["AGENTS.md"] = "# Project instructions\n";
 		writeText(join(ctx.runDir, "base", "surface.json"), surfaceToJson(base));
-		if (outOfBudget(ctx)) return finish(ctx, { outcome: "aborted_budget" });
+		setStage(ctx.watch, `probe ×${opts.cfg.k} (references)`);
+		const stop = stopOutcome(ctx);
+		if (stop) return finish(ctx, { outcome: stop });
 
 		const refs = await mapLimit(range(opts.cfg.k), opts.cfg.maxParallel, (i) =>
-			probeSurface(ctx, base, `ref${i}`, { signal: opts.signal }),
+			probeSurface(ctx, base, `ref${i}`, { signal: ctx.signal }),
 		);
 		for (const ref of refs) {
-			note(ctx, `ref${ref.label.slice(3)}: ${ref.digest.split("\n")[0]} — ${ref.deliverables.length} deliverable file(s), verifier=${ref.verifier ? "yes" : "no"}`);
+			note(
+				ctx,
+				`ref${ref.label.slice(3)}: ${ref.digest.split("\n")[0]} — ${ref.deliverables.length} deliverable file(s), verifier=${ref.verifier ? "yes" : "no"}`,
+			);
 		}
 		return finish(ctx, { outcome: "probed" });
 	} catch (err) {
 		ctx.errors.push((err as Error).message);
-		note(ctx, `error: ${(err as Error).message}`);
+		note(ctx, `error: ${(err as Error).message}`, "error");
 		return finish(ctx, { outcome: "error", errors: true });
 	}
 }
@@ -563,8 +638,12 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		const k = cfg.k;
 
 		// --- probe(base) ×k  (R += k) ---------------------------------------
-		if (outOfBudget(ctx)) return finish(ctx, { outcome: "aborted_budget" });
-		const refs = await mapLimit(range(k), cfg.maxParallel, (i) => probeSurface(ctx, base, `ref${i}`, { signal: opts.signal }));
+		setStage(ctx.watch, `probe ×${k} (references)`);
+		const stop = stopOutcome(ctx);
+		if (stop) return finish(ctx, { outcome: stop });
+		const refs = await mapLimit(range(k), cfg.maxParallel, (i) =>
+			probeSurface(ctx, base, `ref${i}`, { signal: ctx.signal }),
+		);
 
 		// --- propose INV/DOM ×2k (P += 2k) ----------------------------------
 		const composed: Array<{ label: string; candidate: ProposedCandidate }> = [];
@@ -572,40 +651,46 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		let carry: string | undefined;
 
 		const proposeAll = async (index: number): Promise<ProposedCandidate[]> => {
+			setStage(ctx.watch, `propose ×2 (index ${index})`);
 			const argsFor = (lever: EditorStage): ProposeArgs => ({
 				lever,
 				index,
 				base,
 				refDigest: refs[index].digest,
-				evidence: evidenceFor(ctx, index),
+				evidence: evidenceFor(index),
 				library,
 				carry,
-				signal: opts.signal,
+				signal: ctx.signal,
 			});
 			if (cfg.mode === "sequential") {
 				const inv = await proposeStage(ctx, argsFor("propose-inv"));
 				const dom = await proposeStage(ctx, argsFor("propose-dom"));
 				return [inv, dom];
 			}
-			return mapLimit(["propose-inv", "propose-dom"] as const, cfg.maxParallel, (lever) => proposeStage(ctx, argsFor(lever)));
+			return mapLimit(["propose-inv", "propose-dom"] as const, cfg.maxParallel, (lever) =>
+				proposeStage(ctx, argsFor(lever)),
+			);
 		};
 
 		for (const index of range(k)) {
-			if (outOfBudget(ctx)) return finish(ctx, { outcome: "aborted_budget", errors: true });
+			let stop = stopOutcome(ctx);
+			if (stop) return finish(ctx, { outcome: stop, errors: true });
 
 			const candidates = await proposeAll(index);
-			if (outOfBudget(ctx)) return finish(ctx, { outcome: "aborted_budget", errors: true });
+			stop = stopOutcome(ctx);
+			if (stop) return finish(ctx, { outcome: stop, errors: true });
 
 			// --- probe(candidates) (R += 2k) --------------------------------
 			const labels = [`inv${index}`, `dom${index}`];
 			const candProbes = await mapLimit(
 				range(2).map((j) => ({ surface: candidates[j].surface, label: labels[j] })),
 				cfg.maxParallel,
-				(job) => probeSurface(ctx, job.surface, job.label, { signal: opts.signal }),
+				(job) => probeSurface(ctx, job.surface, job.label, { signal: ctx.signal }),
 			);
 			void candProbes; // digests are read back from disk by candidateDigest()
 
-			if (outOfBudget(ctx)) return finish(ctx, { outcome: "aborted_budget", errors: true });
+			stop = stopOutcome(ctx);
+			if (stop) return finish(ctx, { outcome: stop, errors: true });
 
 			// --- compose (P += k) -------------------------------------------
 			const finalCandidate = await composeStage(ctx, {
@@ -615,29 +700,40 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 				candidates,
 				library,
 				carry,
-				signal: opts.signal,
+				signal: ctx.signal,
 			});
 			composed.push({ label: `final${index}`, candidate: finalCandidate });
-			carry = candidates.map((c) => c.notes).filter(Boolean).join(" | ").slice(0, 500) || undefined;
+			carry =
+				candidates
+					.map((c) => c.notes)
+					.filter(Boolean)
+					.join(" | ")
+					.slice(0, 500) || undefined;
 
-			if (outOfBudget(ctx)) return finish(ctx, { outcome: "aborted_budget", errors: true });
+			stop = stopOutcome(ctx);
+			if (stop) return finish(ctx, { outcome: stop, errors: true });
 
 			// --- probe(final) (R += k) ---------------------------------------
-			const finalProbe = await probeSurface(ctx, finalCandidate.surface, `final${index}`, { signal: opts.signal });
+			setStage(ctx.watch, `probe final${index}`);
+			const finalProbe = await probeSurface(ctx, finalCandidate.surface, `final${index}`, { signal: ctx.signal });
 			finalProbes.push(finalProbe);
-			note(ctx, `final${index}: ${finalProbe.digest.split("\n")[0]} — diff ${diffSurface(base, finalCandidate.surface).added.length + diffSurface(base, finalCandidate.surface).modified.length} file(s) changed`);
+			note(
+				ctx,
+				`final${index}: ${finalProbe.digest.split("\n")[0]} — diff ${diffSurface(base, finalCandidate.surface).added.length + diffSurface(base, finalCandidate.surface).modified.length} file(s) changed`,
+			);
 		}
 
 		// --- select (k>1 only) ----------------------------------------------
+		setStage(ctx.watch, "select");
 		const selection = await selectStage(ctx, {
 			finalProbes,
 			composed,
-			signal: opts.signal,
+			signal: ctx.signal,
 		});
 		const chosenLabel = selection.chosenLabel ?? "final0";
 		const chosenEntry = composed.find((c) => c.label === chosenLabel) ?? composed[0];
 		if (!chosenEntry) {
-			note(ctx, "no composed candidate exists — nothing to adopt");
+			note(ctx, "no composed candidate exists — nothing to adopt", "warn");
 			return finish(ctx, { outcome: "fell_back", chosen: null, errors: true });
 		}
 
@@ -645,15 +741,17 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		save(ctx);
 
 		// --- adopt (human gate) ---------------------------------------------
+		setStage(ctx.watch, "adopt gate");
 		const gate = await resolveAdoptionGate(ctx, chosenLabel, chosenEntry.candidate.surface, base, opts);
 		if (!gate.ok) {
+			if (gate.stopped) return finish(ctx, { outcome: "aborted", chosen: chosenLabel });
 			return finish(ctx, { outcome: gate.aborted ? "error" : "pending", chosen: chosenLabel, errors: gate.aborted });
 		}
 		return finish(ctx, { outcome: "adopted", chosen: chosenLabel, adopted: true });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		ctx.errors.push(message);
-		note(ctx, `error: ${message}`);
+		note(ctx, `error: ${message}`, "error");
 		const aborted = err instanceof BudgetError;
 		return finish(ctx, { outcome: aborted ? "aborted_budget" : "error", errors: true });
 	}
@@ -685,13 +783,15 @@ async function selectStage(ctx: RunContext, args: SelectArgs): Promise<Selection
 		return record;
 	}
 
-	if (outOfBudget(ctx)) {
+	if (ctx.signal.aborted || outOfBudget(ctx)) {
 		const fallback = { label: args.composed[0]?.label ?? "final0" };
 		const record: SelectionRecord = {
 			order: args.composed.map((c, i) => ({ id: `c${i}`, label: c.label })),
 			chosenLabel: fallback.label,
 			chosenId: "c0",
-			why: "budget stop before selection — fail-open to the first composed candidate",
+			why: ctx.signal.aborted
+				? "run interrupted before selection — fail-open to the first composed candidate"
+				: "budget stop before selection — fail-open to the first composed candidate",
 			seed: "none",
 			trivial: false,
 		};
@@ -703,8 +803,7 @@ async function selectStage(ctx: RunContext, args: SelectArgs): Promise<Selection
 	const pool = buildPool(args.finalProbes, ctx.runDir, cfg, seed);
 	const mission = buildMission(
 		"select",
-		"select",
-		selectParts({ task: ctx.task, candidates: renderCandidates(pool, cfg) }, cfg),
+		selectParts({ task: ctx.task, candidates: renderCandidates(pool) }, cfg),
 		cfg,
 		ctx.runDir,
 		"selection",
@@ -727,12 +826,19 @@ async function selectStage(ctx: RunContext, args: SelectArgs): Promise<Selection
 	let chosenId: string | null = null;
 	let why = extractTag(run.reply, "why") ?? "";
 	try {
-		chosenId = parseChoice(run.reply, pool.map((c) => c.id));
+		chosenId = parseChoice(
+			run.reply,
+			pool.map((c) => c.id),
+		);
 	} catch (err) {
 		const fallback = fallbackChoice(pool);
 		chosenId = fallback?.id ?? null;
 		why = `fail-open: ${(err as Error).message}`;
-		note(ctx, `selection failed — fail-open to ${chosenId ?? "nothing"}: ${(err as Error).message.slice(0, 160)}`);
+		note(
+			ctx,
+			`selection failed — fail-open to ${chosenId ?? "nothing"}: ${(err as Error).message.slice(0, 160)}`,
+			"warn",
+		);
 	}
 	const chosen = pool.find((c) => c.id === chosenId) ?? pool[0];
 	const record: SelectionRecord = {
@@ -751,6 +857,8 @@ async function selectStage(ctx: RunContext, args: SelectArgs): Promise<Selection
 interface GateResult {
 	ok: boolean;
 	aborted?: boolean;
+	/** The run was interrupted (/rsi-stop) before the gate — close as `aborted`. */
+	stopped?: boolean;
 	message: string;
 }
 
@@ -763,25 +871,32 @@ async function resolveAdoptionGate(
 	opts: LoopOptions,
 ): Promise<GateResult> {
 	const cfg = ctx.cfg;
+	if (ctx.signal.aborted) {
+		return { ok: false, stopped: true, message: "run interrupted before the adoption gate" };
+	}
 	const dirty = workingTreeStatus(ctx.cwd);
 	if (dirty.dirty && !opts.force) {
 		const err = new DirtyTreeError(dirty.lines);
-		note(ctx, `adoption refused: ${err.message}`);
+		note(ctx, `adoption refused: ${err.message}`, "warn");
 		return { ok: false, aborted: true, message: err.message };
 	}
 
 	let confirmed = !cfg.confirmAdopt;
 	if (!confirmed) {
 		const summary = diffText(`adopt ${label}`, diffSurface(base, surface));
+		const scriptReview = renderScriptReview(base, surface);
 		if (opts.io.confirmAdoption) {
-			confirmed = await opts.io.confirmAdoption(`rsi: adopt ${label}?`, `${summary}\n\nThe live tree is updated and a library snapshot is written.`);
+			confirmed = await opts.io.confirmAdoption(
+				`rsi: adopt ${label}?`,
+				`${summary}${scriptReview ? `\n\n${scriptReview}` : ""}\n\nThe live tree is updated and a library snapshot is written.`,
+			);
 		} else {
-			note(ctx, `adoption pending: ${label} — no confirmation channel here, run /rsi-adopt ${label}`);
+			note(ctx, `adoption pending: ${label} — no confirmation channel here, run /rsi-adopt ${label}`, "warn");
 			return { ok: false, message: "confirmation required" };
 		}
 	}
 	if (!confirmed) {
-		note(ctx, `adoption declined for ${label} — candidate kept under ${ctx.runDir}/surfaces/${label}.json`);
+		note(ctx, `adoption declined for ${label} — candidate kept under ${ctx.runDir}/surfaces/${label}.json`, "warn");
 		return { ok: false, message: "declined" };
 	}
 
@@ -797,9 +912,9 @@ async function resolveAdoptionGate(
 	regenerateIndex(ctx.cwd, cfg, ctx.domain);
 	ctx.ledger.adopted = true;
 	save(ctx);
-	note(ctx, `adopted ${label} into the live tree; library entry ${ctx.domain}/${slugify(ctx.task)}`);
+	note(ctx, `adopted ${label} into the live tree; library entry ${ctx.domain}/${slugify(ctx.task)}`, "success");
 
-	await reflectStage(ctx, { label, base: liveBefore, adopted: surface, signal: opts.signal });
+	await reflectStage(ctx, { label, base: liveBefore, adopted: surface, signal: ctx.signal });
 	return { ok: true, message: "adopted" };
 }
 
@@ -809,6 +924,7 @@ async function reflectStage(
 	opts: { label: string; base: Surface; adopted: Surface; signal?: AbortSignal },
 ): Promise<void> {
 	const cfg = ctx.cfg;
+	setStage(ctx.watch, "reflect");
 	const diff = diffSurface(opts.base, opts.adopted);
 	const composeNotes = readComposeNotes(ctx.runDir);
 	const identity = assertIdentity(ctx.ledger);
@@ -819,13 +935,16 @@ async function reflectStage(
 		`task: ${ctx.task}`,
 	].join("\n");
 
+	if (ctx.signal.aborted) {
+		note(ctx, "reflection skipped: run interrupted");
+		return;
+	}
 	if (outOfBudget(ctx)) {
 		note(ctx, "reflection skipped: budget stop");
 		return;
 	}
 	try {
 		const mission = buildMission(
-			"reflect",
 			"reflect",
 			reflectParts(
 				{ task: ctx.task, domain: ctx.domain, diffSummary: diffText("base vs adopted", diff), composeNotes, record },
@@ -843,7 +962,12 @@ async function reflectStage(
 			runDir: ctx.runDir,
 			cfg,
 			attempt: 0,
-			fake: { stage: "reflect", domain: ctx.domain, skillName: `${ctx.domain}-notes`, baseAgents: opts.base["AGENTS.md"] ?? "" },
+			fake: {
+				stage: "reflect",
+				domain: ctx.domain,
+				skillName: `${ctx.domain}-notes`,
+				baseAgents: opts.base["AGENTS.md"] ?? "",
+			},
 			signal: opts.signal,
 		});
 		addEntry(ctx.ledger, { kind: "reflection", label: "reflect", usd: run.usd, attempts: 1, wallMs: run.wallMs });
@@ -861,13 +985,19 @@ async function reflectStage(
 			label: opts.label,
 		});
 		if (result.written) note(ctx, `reflection written to library/${ctx.domain}/${slugify(ctx.task)}/EXPERIENCE.md`);
-		else note(ctx, `reflection rejected: ${result.errors.join("; ")}`);
+		else note(ctx, `reflection rejected: ${result.errors.join("; ")}`, "warn");
+		if (result.superseded.length > 0) {
+			note(
+				ctx,
+				`superseded older same-cue lesson(s): ${result.superseded.join(", ")} (kept on disk, no longer served)`,
+			);
+		}
 	} catch (err) {
 		if (err instanceof BudgetError) {
 			note(ctx, `reflection skipped: ${err.message}`);
 			return;
 		}
-		note(ctx, `reflection failed: ${(err as Error).message}`);
+		note(ctx, `reflection failed: ${(err as Error).message}`, "warn");
 	}
 }
 
@@ -892,13 +1022,15 @@ interface FinishOptions {
 
 function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 	ctx.ledger.outcome = opts.outcome;
+	if (opts.outcome === "aborted")
+		note(ctx, "run interrupted via /rsi-stop — nothing adopted, evidence kept under the run dir", "warn");
 	if (opts.chosen !== undefined) ctx.ledger.chosen = opts.chosen;
 	if (opts.adopted) ctx.ledger.adopted = true;
 	save(ctx);
 
 	const identity = assertIdentity(ctx.ledger);
 	if (!identity.ok && opts.outcome === "adopted") {
-		note(ctx, `identity mismatch: ${identity.problems.join("; ")}`);
+		note(ctx, `identity mismatch: ${identity.problems.join("; ")}`, "error");
 	}
 	const status = renderStatus({ ledger: ctx.ledger, cfg: ctx.cfg });
 	writeText(join(ctx.runDir, "status.txt"), `${status}\n`);
@@ -924,6 +1056,8 @@ function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 		),
 	);
 
+	endRun(ctx.watch.runId);
+	ctx.releaseLock();
 	return {
 		runId: ctx.runId,
 		runDir: ctx.runDir,
@@ -961,21 +1095,8 @@ export interface CommandResult {
 
 /** Latest run directory that has a ledger, or undefined. */
 export function latestRunDir(cwd: string): string | undefined {
-	const runsDir = join(cwd, ".pi", "harness", "runs");
-	let names: string[];
-	try {
-		names = listFiles(runsDir)
-			.filter((f) => f.endsWith("/ledger.json") || f === "ledger.json")
-			.map((f) => f.split("/")[0]);
-	} catch {
-		return undefined;
-	}
-	const unique = [...new Set(names)].sort().reverse();
-	for (const name of unique) {
-		const dir = join(runsDir, name);
-		if (loadLedger(dir)) return dir;
-	}
-	return undefined;
+	const runId = latestRunId(cwd);
+	return runId ? join(runsDir(cwd), runId) : undefined;
 }
 
 export function runDirFor(cwd: string, runId?: string): string | undefined {
@@ -993,6 +1114,11 @@ export function statusOfRun(opts: Pick<CommandOptions, "cwd" | "cfg" | "runId">)
 	const ledger = loadLedger(runDir);
 	if (!ledger) return { ok: false, text: `run ${runDir} has no readable ledger.json` };
 	return { ok: true, text: renderStatus({ ledger, cfg: opts.cfg }) };
+}
+
+/** Status-bar headline for a rendered `/rsi-status` report (no line-index coupling). */
+export function statusHeadline(text: string): string {
+	return text.split("\n").find((line) => line.startsWith("outcome:")) ?? "rsi";
 }
 
 /**
@@ -1033,7 +1159,10 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 	}
 
 	const cfg = opts.cfg;
-	const report = validate(surface, cfg, { where: label });
+	const liveBefore = readSurface(opts.cwd, cfg);
+	// Delta-only: adopting over a live tree that already carries an issue must
+	// not be blocked by that pre-existing issue.
+	const report = validate(surface, cfg, { where: label, base: liveBefore });
 	if (report.errors.length > 0) {
 		return { ok: false, message: `snapshot fails validation, not adopting:\n${report.errors.join("\n")}` };
 	}
@@ -1045,15 +1174,27 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 
 	let confirmed = !cfg.confirmAdopt || opts.confirmed === true;
 	if (!confirmed) {
-		const live = readSurface(opts.cwd, cfg);
 		if (opts.io.confirmAdoption) {
-			confirmed = await opts.io.confirmAdoption(`rsi: adopt ${label}?`, diffText(`adopt ${label}`, diffSurface(live, surface)));
+			const scriptReview = renderScriptReview(liveBefore, surface);
+			confirmed = await opts.io.confirmAdoption(
+				`rsi: adopt ${label}?`,
+				diffText(`adopt ${label}`, diffSurface(liveBefore, surface)) + (scriptReview ? `\n\n${scriptReview}` : ""),
+			);
 		} else {
 			return { ok: false, message: `confirmation required (pass --yes) to adopt ${label}` };
 		}
 	}
 	if (!confirmed) return { ok: false, message: `adoption of ${label} declined — live tree untouched` };
 
+	const lock = acquireRunLock(opts.cwd, ledger.runId);
+	if (!lock.ok) return { ok: false, message: new RunLockedError(lock.holder).message };
+
+	const run = attachWatch({ runId: ledger.runId, runDir, task: ledger.task, domain: ledger.domain, kind: "adopt" });
+	if (run.signal.aborted) {
+		endRun(ledger.runId);
+		lock.release();
+		return { ok: false, message: "stop requested — adoption aborted before touching the live tree" };
+	}
 	const ctx: RunContext = {
 		runId: ledger.runId,
 		runDir,
@@ -1065,8 +1206,11 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 		domain: ledger.domain,
 		errors: [],
 		budgetsUsed: ledger.budgetsUsed,
+		watch: run.watch,
+		signal: run.signal,
+		clean: !dirty.dirty,
+		releaseLock: lock.release,
 	};
-	const liveBefore = readSurface(opts.cwd, cfg);
 	writeSurface(opts.cwd, surface, { prune: true });
 	adoptSurface(opts.cwd, cfg, { domain: ctx.domain, slug: slugify(ledger.task), liveBefore, adopted: surface });
 	regenerateIndex(opts.cwd, cfg, ctx.domain);
@@ -1074,9 +1218,9 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 	ctx.ledger.chosen = label;
 	ctx.ledger.outcome = "adopted";
 	save(ctx);
-	note(ctx, `adopted ${label} via /rsi-adopt`);
+	note(ctx, `adopted ${label} via /rsi-adopt`, "success");
 
-	await reflectStage(ctx, { label, base: liveBefore, adopted: surface });
+	await reflectStage(ctx, { label, base: liveBefore, adopted: surface, signal: ctx.signal });
 	const finalReport = finish(ctx, { outcome: "adopted", chosen: label, adopted: true });
 	return { ok: true, message: `adopted ${label}`, report: finalReport };
 }

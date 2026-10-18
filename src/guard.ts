@@ -48,6 +48,50 @@ export function tripwireError(subject: string, marker: string): string {
 	return `tripwire: forbidden marker "${marker}" in ${subject} — this surface edits behaviour, not graders; remove it and retry`;
 }
 
+/**
+ * Skill-script supply-chain scan (README “Safety model”). A `.pi/skills/<name>/scripts/**`
+ * file is *executable capability*: it is mounted into every probe sandbox from
+ * then on. Candidates are scanned for hostile shell before they can be probed or
+ * adopted — fail-closed like the tripwires (review before you mount).
+ *
+ * Deliberately narrow: plain `curl` to a local health endpoint is fine; what is
+ * forbidden is fetch-and-execute, credential access, exfil and persistence.
+ */
+export interface ScriptMarker {
+	id: string;
+	re: RegExp;
+}
+
+export const SCRIPT_MARKERS: readonly ScriptMarker[] = [
+	{ id: "pipe-to-shell", re: /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da|fi)?sh\b/ },
+	{ id: "base64-pipe-exec", re: /base64\s+(?:--)?decode\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da|fi)?sh\b/ },
+	{ id: "eval-network", re: /\beval\b[^\n]*\b(?:curl|wget|base64)\b/ },
+	{ id: "sudo", re: /\bsudo\b/ },
+	{ id: "ssh-secrets", re: /\.ssh\b|id_rsa\b|id_ed25519\b/ },
+	{
+		id: "credential-store",
+		re: /\.aws\/|\.gnupg\/|\.kube\/|\.docker\/config\.json|\.config\/gcloud|\.netrc\b|password-store/,
+	},
+	{ id: "agent-config-access", re: /\.config\/pi\b|\.pi\/agent\b|\.claude\b|\.codex\/|\.continue\/|\.cursor\// },
+	{ id: "reverse-shell", re: /\/dev\/tcp\/[^\s]+\s+0>&1|\bncat\b[^|\n]*\s-e\s|\bnc\b[^|\n]*\s-e\s/ },
+	{ id: "rm-escape", re: /rm\s+-[a-zA-Z]*[rRf][a-zA-Z]*\s+(?:--no-preserve-root\s+)?["']?(?:\/|~|\$HOME|\.\.\/)/ },
+	{ id: "env-exfil", re: /\b(?:curl|wget)\b[^|\n]*\$\(\s*(?:env|printenv)\s*\)/ },
+	{ id: "history-wipe", re: /\bhistory\s+-c\b|>\s*["']?~?\/?\.bash_history/ },
+];
+
+/** All marker ids matching a script body (empty array = clean). */
+export function scanScriptBody(path: string, body: string): string[] {
+	const hits: string[] = [];
+	for (const marker of SCRIPT_MARKERS) {
+		if (marker.re.test(`${path}\n${body}`)) hits.push(marker.id);
+	}
+	return hits;
+}
+
+export function scriptScanError(path: string, id: string): string {
+	return `script scan: forbidden pattern "${id}" in ${path} — skill scripts run in every probe sandbox; remove the pattern and retry`;
+}
+
 /** Forbidden-path check against `rsi.forbiddenGlobs`. Returns the pattern that matched. */
 export function forbiddenMatch(path: string, cfg: Pick<RsiConfig, "forbiddenGlobs">): string | undefined {
 	return matchesAnyGlob(path, cfg.forbiddenGlobs);
@@ -71,7 +115,9 @@ export class AdoptionGateError extends Error {
 export function assertAdoptionAllowed(cfg: Pick<RsiConfig, "confirmAdopt">, confirmed: boolean): void {
 	if (!cfg.confirmAdopt) return;
 	if (!confirmed) {
-		throw new AdoptionGateError("adoption not confirmed — surface unchanged; run /rsi-adopt <label> to adopt a composed candidate");
+		throw new AdoptionGateError(
+			"adoption not confirmed — surface unchanged; run /rsi-adopt <label> to adopt a composed candidate",
+		);
 	}
 }
 
@@ -80,11 +126,38 @@ export interface DirtyReport {
 	lines: string[];
 }
 
+/**
+ * Harness-managed paths that must never count as "dirty": the extension writes
+ * `.pi/harness/.gitignore` itself on every run, and `runs/`/`worktrees/`/the lock
+ * are ephemeral. Without this filter the very first run in a fresh project would
+ * create a file and then refuse itself for having a dirty tree.
+ */
+const HARNESS_EPHEMERAL = [".pi/harness/.gitignore", ".pi/harness/run.lock"];
+const HARNESS_EPHEMERAL_PREFIXES = [".pi/harness/runs/", ".pi/harness/worktrees/"];
+
+function isHarnessEphemeral(path: string): boolean {
+	return HARNESS_EPHEMERAL.includes(path) || HARNESS_EPHEMERAL_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
 /** `git status --porcelain` in the live working tree (never in a sandbox). */
 export function workingTreeStatus(cwd: string): DirtyReport {
 	try {
-		const out = execSync("git status --porcelain", { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-		const lines = out.split("\n").map((l) => l.trimEnd()).filter((l) => l.length > 0);
+		// `--untracked-files=all` avoids git collapsing a directory to one `?? dir/`
+		// line, so the ephemeral filter below can see the individual paths.
+		const out = execSync("git status --porcelain --untracked-files=all", {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const lines = out
+			.split("\n")
+			.map((l) => l.trimEnd())
+			.filter((l) => l.length > 0)
+			.filter((l) => {
+				const raw = l.slice(3);
+				const path = raw.includes(" -> ") ? (raw.split(" -> ").pop() ?? raw) : raw;
+				return !isHarnessEphemeral(path.replace(/^"|"$/g, ""));
+			});
 		return { dirty: lines.length > 0, lines };
 	} catch {
 		// Not a git repository (or git missing): nothing to protect, nothing to leak.

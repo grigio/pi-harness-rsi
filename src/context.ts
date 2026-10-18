@@ -10,7 +10,7 @@
  *    editor still gets a pointer instead of a slice.
  */
 
-import type { Budgets, RsiConfig } from "./config";
+import type { Budgets } from "./config";
 import { charLen, extractTag } from "./util";
 
 export type MissionStage = "propose" | "compose" | "reflect" | "select";
@@ -95,25 +95,23 @@ export function assemble(stage: MissionStage, parts: readonly MissionPart[], bud
 		text = `${text}\n\n${chunkOf(part)}`;
 	}
 
-	// Pass 3: optional parts, whole-or-nothing, reserving room for the drop notice.
+	// Pass 3: optional parts, whole-or-nothing. Optional content may never
+	// raise: if a part (and later even its drop-notice) will not fit, the part is
+	// dropped whole and the run continues with what already fits.
 	for (const part of parts) {
 		if (!part.optional) continue;
 		const size = charLen(chunkOf(part)) + 2;
-		const without = charLen(text);
-		if (without + size <= budget) {
+		if (charLen(text) + size <= budget) {
 			text = `${text}\n\n${chunkOf(part)}`;
 			continue;
-		}
-		// Does not fit: record the whole-part drop, but only if the notice still fits.
-		const names = [...dropped, part.name];
-		if (without + charLen(noticeOf(names)) + 2 > budget) {
-			throw new BudgetError(stage, budget, without + charLen(noticeOf(names)) + 2, `${part.name} + drop-notice`);
 		}
 		dropped.push(part.name);
 	}
 
 	if (dropped.length > 0) {
-		text = `${text}\n\n${noticeOf(dropped)}`;
+		const notice = noticeOf(dropped);
+		// The notice is itself best-effort: never let it push the mission over budget.
+		if (charLen(text) + charLen(notice) + 2 <= budget) text = `${text}\n\n${notice}`;
 	}
 
 	const used = charLen(text);
@@ -139,11 +137,6 @@ export function capNotes(notes: string, budgets: Budgets): string {
 	const max = budgets.notes;
 	if (charLen(notes) <= max) return notes;
 	return `${[...notes].slice(0, max - 1).join("")}…`;
-}
-
-/** Config convenience: budgets of the active profile with overrides applied. */
-export function budgetsOf(cfg: Pick<RsiConfig, "budgets">): Budgets {
-	return cfg.budgets;
 }
 
 /** Re-export so callers only import `context` for anything budget-shaped. */

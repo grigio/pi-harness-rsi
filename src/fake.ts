@@ -65,7 +65,14 @@ export function fakeSessionJsonl(input: FakeSessionInput): string {
 			api: "fake",
 			provider: "fake",
 			model: "fake-solver",
-			usage: { input: 120, output: 24, cacheRead: 0, cacheWrite: 0, totalTokens: 144, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost / 4 } },
+			usage: {
+				input: 120,
+				output: 24,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 144,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost / 4 },
+			},
 			stopReason: "toolUse",
 			timestamp: 1_700_000_000_020,
 		},
@@ -82,9 +89,7 @@ export function fakeSessionJsonl(input: FakeSessionInput): string {
 			content: [
 				{
 					type: "text",
-					text: isRef
-						? "FAIL src/foo.test.ts — expected 3, got 4\nexit code 1"
-						: "PASS 14/14 checks\nexit code 0",
+					text: isRef ? "FAIL src/foo.test.ts — expected 3, got 4\nexit code 1" : "PASS 14/14 checks\nexit code 0",
 				},
 			],
 			isError: isRef,
@@ -99,12 +104,24 @@ export function fakeSessionJsonl(input: FakeSessionInput): string {
 		message: {
 			role: "assistant",
 			content: [
-				{ type: "toolCall", id: "call-2", name: "edit", arguments: { path: "src/index.ts", oldString: "a", newString: "b" } },
+				{
+					type: "toolCall",
+					id: "call-2",
+					name: "edit",
+					arguments: { path: "src/index.ts", oldString: "a", newString: "b" },
+				},
 			],
 			api: "fake",
 			provider: "fake",
 			model: "fake-solver",
-			usage: { input: 260, output: 41, cacheRead: 0, cacheWrite: 0, totalTokens: 301, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost / 4 } },
+			usage: {
+				input: 260,
+				output: 41,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 301,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost / 4 },
+			},
 			stopReason: "toolUse",
 			timestamp: 1_700_000_000_040,
 		},
@@ -134,7 +151,14 @@ export function fakeSessionJsonl(input: FakeSessionInput): string {
 			api: "fake",
 			provider: "fake",
 			model: "fake-solver",
-			usage: { input: 480, output: 60, cacheRead: 0, cacheWrite: 0, totalTokens: 540, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost / 2 } },
+			usage: {
+				input: 480,
+				output: 60,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 540,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost / 2 },
+			},
 			stopReason: "stop",
 			timestamp: 1_700_000_000_060,
 		},
@@ -212,7 +236,9 @@ export function fakeEditorReply(ctx: FakeEditorContext): string {
 	}
 
 	if (ctx.stage === "select") {
-		return ["```choice", "c0", "```", "<why>anonymized deliverable c0 showed the fewest failing checks</why>"].join("\n");
+		return ["```choice", "c0", "```", "<why>anonymized deliverable c0 showed the fewest failing checks</why>"].join(
+			"\n",
+		);
 	}
 
 	const agents = ctx.baseAgents.endsWith("\n") ? ctx.baseAgents : `${ctx.baseAgents}\n`;
@@ -226,34 +252,27 @@ export function fakeEditorReply(ctx: FakeEditorContext): string {
 	}
 
 	if (ctx.stage === "propose-inv") {
-		return replyWithEdits(
-			"added a four-step procedure to the always-on file",
-			[{ path: "AGENTS.md", op: "write", content: `${agents}\n${INV_SECTION(ctx.domain)}` }],
-		);
+		return replyWithEdits("added a four-step procedure to the always-on file", [
+			{ path: "AGENTS.md", op: "write", content: `${agents}\n${INV_SECTION(ctx.domain)}` },
+		]);
 	}
 
 	if (ctx.stage === "propose-dom") {
 		const withTrigger = `${agents}- Skill trigger: ${ctx.skillName} — load for ${ctx.domain} tasks (notes, checklists).\n`;
-		return replyWithEdits(
-			"shipped a domain skill and named it in the always-on file",
-			[
-				{ path: "AGENTS.md", op: "write", content: withTrigger },
-				{ path: `.pi/skills/${ctx.skillName}/SKILL.md`, op: "write", content: skillFile(ctx.domain) },
-				{ path: `.pi/skills/${ctx.skillName}/scripts/check.sh`, op: "write", content: SKILL_SCRIPT(ctx.domain) },
-			],
-		);
+		return replyWithEdits("shipped a domain skill and named it in the always-on file", [
+			{ path: "AGENTS.md", op: "write", content: withTrigger },
+			{ path: `.pi/skills/${ctx.skillName}/SKILL.md`, op: "write", content: skillFile(ctx.domain) },
+			{ path: `.pi/skills/${ctx.skillName}/scripts/check.sh`, op: "write", content: SKILL_SCRIPT(ctx.domain) },
+		]);
 	}
 
 	// compose: merge both levers (procedure + skill), still under the always-on cap.
 	const merged = `${agents}\n${INV_SECTION(ctx.domain)}- Skill trigger: ${ctx.skillName} — load for ${ctx.domain} tasks (notes, checklists).\n`;
-	return replyWithEdits(
-		"composed the procedure and the domain skill",
-		[
-			{ path: "AGENTS.md", op: "write", content: merged },
-			{ path: `.pi/skills/${ctx.skillName}/SKILL.md`, op: "write", content: skillFile(ctx.domain) },
-			{ path: `.pi/skills/${ctx.skillName}/scripts/check.sh`, op: "write", content: SKILL_SCRIPT(ctx.domain) },
-		],
-	);
+	return replyWithEdits("composed the procedure and the domain skill", [
+		{ path: "AGENTS.md", op: "write", content: merged },
+		{ path: `.pi/skills/${ctx.skillName}/SKILL.md`, op: "write", content: skillFile(ctx.domain) },
+		{ path: `.pi/skills/${ctx.skillName}/scripts/check.sh`, op: "write", content: SKILL_SCRIPT(ctx.domain) },
+	]);
 }
 
 interface FakeFileChange {

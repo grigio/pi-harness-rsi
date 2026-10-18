@@ -12,8 +12,19 @@
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
-import { forbiddenMatch, forbiddenError, scanTripwire, tripwireError } from "./guard";
-import { charLen, ensureDir, exists, globToRegExp, hash12, listFiles, readTextIf, toPosix, writeText } from "./util";
+import { forbiddenError, forbiddenMatch, scanScriptBody, scanTripwire, scriptScanError, tripwireError } from "./guard";
+import {
+	charLen,
+	ensureDir,
+	exists,
+	globToRegExp,
+	hash12,
+	listFiles,
+	readTextIf,
+	toPosix,
+	truncateEnd,
+	writeText,
+} from "./util";
 
 /** posix-relative surface path → file content. */
 export type Surface = Record<string, string>;
@@ -95,17 +106,15 @@ export function skillDirOf(path: string): string | undefined {
 	return m?.[1];
 }
 
-export function isAlwaysOn(path: string): boolean {
-	return path === "AGENTS.md";
-}
-
 /** Read the surface out of a working tree (live tree or sandbox). */
 export function readSurface(root: string, cfg?: Pick<RsiConfig, "forbiddenGlobs">): Surface {
 	const surface: Surface = {};
 	const agents = join(root, "AGENTS.md");
 	if (exists(agents)) surface["AGENTS.md"] = readTextIf(agents) ?? "";
 
-	const candidates = listFiles(root, { excludeDirs: [".git", "node_modules", ".pi/harness", "dist", "build", ".cache"] });
+	const candidates = listFiles(root, {
+		excludeDirs: [".git", "node_modules", ".pi/harness", "dist", "build", ".cache"],
+	});
 	for (const rel of candidates) {
 		if (rel === "AGENTS.md") continue;
 		if (isAllowedPath(rel) !== undefined) continue;
@@ -159,10 +168,6 @@ export function applyDelta(base: Surface, delta: SurfaceDelta): Surface {
 	return out;
 }
 
-export function isEmptyDelta(delta: SurfaceDelta): boolean {
-	return !delta.files || delta.files.length === 0;
-}
-
 export function diffSurface(base: Surface, cand: Surface): SurfaceDiff {
 	const diff: SurfaceDiff = { added: [], removed: [], modified: [], unchanged: [], alwaysOnDelta: 0, charsDelta: 0 };
 	const paths = new Set([...Object.keys(base), ...Object.keys(cand)]);
@@ -207,15 +212,18 @@ export function parseFrontmatter(text: string): FrontmatterReport {
 		const idx = line.indexOf(":");
 		if (idx === -1) continue;
 		const key = line.slice(0, idx).trim();
-		const value = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+		const value = line
+			.slice(idx + 1)
+			.trim()
+			.replace(/^["']|["']$/g, "");
 		if (key) fields[key] = value;
 	}
-	if (!fields["name"]) errors.push("frontmatter is missing `name:`");
-	if (!fields["description"]) errors.push("frontmatter is missing `description:` (pi will not load the skill without it)");
+	if (!fields.name) errors.push("frontmatter is missing `name:`");
+	if (!fields.description) errors.push("frontmatter is missing `description:` (pi will not load the skill without it)");
 	return {
 		ok: errors.length === 0,
-		name: fields["name"],
-		description: fields["description"],
+		name: fields.name,
+		description: fields.description,
 		body: m[2] ?? "",
 		errors,
 	};
@@ -224,11 +232,32 @@ export function parseFrontmatter(text: string): FrontmatterReport {
 /**
  * Full validation of a candidate surface. Errors block probing (P3: fail closed
  * to the base surface); warnings are surfaced but never block.
+ *
+ * When `opts.base` is given, only errors/warnings that the candidate *adds*
+ * relative to the base are returned. This is what makes validation delta-only:
+ * a pre-existing hostile script or tripwire phrase in the host tree must not
+ * make every proposal un-adoptable (README "Delta-only review").
  */
-export function validate(surface: Surface, cfg: RsiConfig, opts: { where?: string } = {}): ValidationReport {
+export function validate(
+	surface: Surface,
+	cfg: RsiConfig,
+	opts: { where?: string; base?: Surface } = {},
+): ValidationReport {
+	const direct = validateSurface(surface, cfg, opts.where);
+	if (!opts.base) return direct;
+	const baseReport = validateSurface(opts.base, cfg, opts.where);
+	const baseErrors = new Set(baseReport.errors);
+	const baseWarnings = new Set(baseReport.warnings);
+	return {
+		errors: direct.errors.filter((e) => !baseErrors.has(e)),
+		warnings: direct.warnings.filter((w) => !baseWarnings.has(w)),
+	};
+}
+
+function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): ValidationReport {
 	const errors: string[] = [];
 	const warnings: string[] = [];
-	const where = opts.where ? `${opts.where}: ` : "";
+	const where = whereOpt ? `${whereOpt}: ` : "";
 	const budgets = cfg.budgets;
 
 	// 1. Path whitelist (delta paths are surface paths, so this covers every key).
@@ -242,6 +271,11 @@ export function validate(surface: Surface, cfg: RsiConfig, opts: { where?: strin
 		if (forbidden) errors.push(where + forbiddenError(path, forbidden));
 		const marker = scanTripwire(path, surface[path] ?? "");
 		if (marker) errors.push(where + tripwireError(path, marker));
+		if (RE_SKILL_SCRIPT.test(path)) {
+			for (const id of scanScriptBody(path, surface[path] ?? "")) {
+				errors.push(where + scriptScanError(path, id));
+			}
+		}
 	}
 
 	// 2. Always-on file.
@@ -299,7 +333,9 @@ export function validate(surface: Surface, cfg: RsiConfig, opts: { where?: strin
 		for (const ref of referenced) {
 			const full = `.pi/skills/${dir}/${ref}`;
 			if (!(full in surface)) {
-				errors.push(`${where}${skillMdPath}: references "${ref}" but the file is not part of the surface — ship it under scripts/ or drop the reference`);
+				errors.push(
+					`${where}${skillMdPath}: references "${ref}" but the file is not part of the surface — ship it under scripts/ or drop the reference`,
+				);
 			}
 		}
 
@@ -320,10 +356,51 @@ export function validate(surface: Surface, cfg: RsiConfig, opts: { where?: strin
 
 /** File map lines for missions: `path  N chars`. Never includes content (P2). */
 export function renderFileMap(surface: Surface, root = ""): string[] {
-	const prefix = root ? root.replace(/\/$/, "") + "/" : "";
+	const prefix = root ? `${root.replace(/\/$/, "")}/` : "";
 	return Object.keys(surface)
 		.sort()
 		.map((path) => `${prefix}${path}  ${charLen(surface[path])} chars`);
+}
+
+export interface ScriptReviewOptions {
+	maxFiles?: number;
+	excerptChars?: number;
+	totalChars?: number;
+}
+
+/**
+ * Adoption-gate review block for added/modified skill scripts. Scripts are
+ * executable capability mounted into every future sandbox, so the *human* gate
+ * shows their content (bounded excerpt + hash), not just their path. Human-facing
+ * only — never assembled into a mission, so it costs no model context.
+ */
+export function renderScriptReview(base: Surface, cand: Surface, opts: ScriptReviewOptions = {}): string | undefined {
+	const maxFiles = opts.maxFiles ?? 4;
+	const excerptChars = opts.excerptChars ?? 1_200;
+	const totalChars = opts.totalChars ?? 4_000;
+	const changed = Object.keys(cand)
+		.filter((p) => RE_SKILL_SCRIPT.test(p) && cand[p] !== base[p])
+		.sort();
+	if (changed.length === 0) return undefined;
+
+	const lines = ["review these skill scripts — they run in every probe sandbox:"];
+	let budget = totalChars;
+	let shown = 0;
+	for (const path of changed.slice(0, maxFiles)) {
+		const body = cand[path] ?? "";
+		const excerpt = truncateEnd(body, excerptChars, "…[open the file for the rest]");
+		const block = `! ${path}  ${hash12(body)}  ${charLen(body)} chars\n${excerpt
+			.split("\n")
+			.map((l) => `    ${l}`)
+			.join("\n")}`;
+		if (charLen(block) > budget) break;
+		lines.push(block);
+		budget -= charLen(block);
+		shown++;
+	}
+	if (shown < changed.length)
+		lines.push(`  … ${changed.length - shown} more changed script(s) not shown — open them before adopting`);
+	return lines.join("\n");
 }
 
 export function surfaceToJson(surface: Surface): string {
@@ -334,7 +411,8 @@ export function surfaceToJson(surface: Surface): string {
 
 export function surfaceFromJson(text: string): Surface {
 	const parsed = JSON.parse(text) as Surface;
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("surface snapshot is not an object");
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+		throw new Error("surface snapshot is not an object");
 	for (const [path, content] of Object.entries(parsed)) {
 		if (typeof content !== "string") throw new Error(`surface snapshot entry "${path}" is not a string`);
 	}

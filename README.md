@@ -6,8 +6,8 @@ budgeted by one choke point, and nothing is ever silently truncated.
 
 Design: budgets, the editable surface, the safety model and a full example
 workflow are documented below — and enforced in code (`src/context.ts`,
-`src/guard.ts`, `src/ledger.ts`) with 49 tests, so every invariant here is
-executable rather than aspirational.
+`src/guard.ts`, `src/ledger.ts`) with an executable test suite, so every
+invariant here is executable rather than aspirational.
 The loop: `snapshot → probe ×k → propose INV/DOM ×2k → probe ×2k → compose ×k → probe ×k → select → adopt → reflect`.
 
 ## Load it
@@ -24,13 +24,24 @@ pi install /path/to/pi-harness-rsi              # registers in settings
 | `/rsi <task>` | Full loop. Flags: `--domain <name>` `--k <n>` `--mode parallel\|sequential` `--force` `--yes` |
 | `/rsi-probe <task>` | Reference executions + digests only (no editor, no edits) |
 | `/rsi-status [runId]` | Ledger identity `R=4k, P=3k`, USD, fallbacks, diversity, budget usage |
+| `/rsi-watch [--follow] [--lines <n>]` | Live view of the in-flight run: stage, elapsed, USD, latest notes (`--follow` tails until it closes) |
+| `/rsi-stop` | Interrupt the in-flight run before its normal end (see *Interruption* below) |
 | `/rsi-adopt [label] [--yes] [--force] [--run <id>]` | Human gate: apply a composed surface, snapshot library, reflect |
 | `/rsi-revert [domain/slug]` | Restore the previous adopted surface from the library |
 | `/rsi-library [domain]` | Domains, entries, `INDEX.md`, `EXPERIENCE.md` |
 
+Adoption and reflection also maintain the library's health: a new lesson whose
+cue matches an older one **supersedes** it (the old entry stays on disk for
+audit, but stops entering missions), and every rendered lesson carries its
+`adopted:` date so the editor can weigh staleness.
+
 Headless (`pi --print "/rsi …"`) mirrors every report to stdout; adoption stays
 gated — without `--yes` a headless run ends as `outcome: pending` and tells you
 the `/rsi-adopt` command to run next.
+
+Only one run can be in flight per session: `/rsi`, `/rsi-probe` and
+`/rsi-adopt` refuse while another run is active; `/rsi-watch` inspects the
+in-flight run and `/rsi-stop` interrupts it.
 
 ## How to use
 
@@ -182,9 +193,52 @@ surfaces and the ledger (`R=4k, P=3k`, USD, fallbacks, budgets) live under
 - `.pi/prompts/<name>.md`
 - `.pi/skills/<name>/{SKILL.md, scripts/**}`
 
+Because `scripts/**` is *executable capability* mounted into every probe
+sandbox, candidates are **script-scanned** (fetch-and-execute, `sudo`, credential
+paths, reverse shells, env exfil — fail-closed like the tripwires), and the
+adoption gate shows the content of every added/modified script (bounded excerpt
++ hash), not just its path.
+
 Never editable: `tests/**`, `**/*.test.ts`, `.github/**`, `package.json`, lockfiles
 (`rsi.forbiddenGlobs`), plus grader-gaming tripwire phrases
 (`pass_rate`, `delete the failing test`, …) scanned in every candidate.
+
+## What to gitignore in the host project
+
+The extension manages most of this itself: on every run it writes
+`.pi/harness/.gitignore` containing `worktrees/`, `runs/` and `run.lock`
+(idempotent, it never touches `.gitignore` at the repo root or
+`.git/info/exclude`), so the ephemeral artifacts below never show up in
+`git status`.
+
+**Commit these** — they are the harness's durable state, and without them a
+fresh clone starts from zero:
+
+| Path | Why |
+| --- | --- |
+| `AGENTS.md`, `.pi/skills/`, `.pi/prompts/` | the adopted surface — the habits the harness actually learned |
+| `.pi/harness/library/` | `INDEX.md`, `EXPERIENCE.md`, `surface/`, `previous/` — the experience that seeds the next run and makes `/rsi-revert` work |
+| `.pi/settings.json` | the `rsi` config (verifier, budget, profile) so runs are reproducible across machines |
+| `.pi/harness/.gitignore` | optional to commit (it is regenerated anyway); committing it documents the intent |
+
+**Never commit** — regenerated and/or self-contained:
+
+| Path | Why |
+| --- | --- |
+| `.pi/harness/runs/` | per-run evidence: session JSONL, rollouts, digests, candidate surfaces; large, contains verbatim transcripts and duplicated source |
+| `.pi/harness/worktrees/` | throwaway working copies of the whole repo, one per reference execution |
+| `.pi/harness/run.lock` | cross-process run lock (live pid + run id); regenerated, never useful in history |
+
+If you prefer a single rule at the repo root instead of the generated file:
+
+```gitignore
+.pi/harness/runs/
+.pi/harness/worktrees/
+.pi/harness/run.lock
+```
+
+(Do **not** ignore `.pi/harness/` or `.pi/harness/library/` wholesale — that
+would silently drop the learned experience you are supposed to version).
 
 ## Context budgets (profile `small`, the default)
 
@@ -208,17 +262,25 @@ Profile `large` doubles these (set `rsi.profile`).
 ```jsonc
 {
   "rsi": {
-    "profile": "small",          // or "large"
+    "profile": "small",          // or "large" (doubles every budget below)
     "k": 1,                      // references per domain index (R=4k, P=3k)
     "mode": "parallel",          // or "sequential"
-    "editorModel": null,          // child-pi model overrides
+    "editorModel": null,         // child-pi model overrides (null = inherit)
     "solverModel": null,
-    "verifier": null,             // e.g. "bun test" — evidence line, never a score
-    "confirmAdopt": true,         // keep the P6 human gate on
+    "thinking": null,            // child-pi --thinking level, when set
+    "tools": "read,bash,edit,write,grep,find,ls",   // solver tool allowlist
+    "editorTools": "read,grep,find,ls",             // editor is answer-only
+    "verifier": null,            // e.g. "bun test" — evidence line, never a score
+    "confirmAdopt": true,        // keep the P6 human gate on
+    "requireClean": true,        // refuse to start on a dirty tree (unless --force)
     "maxUsd": 2,
     "maxParallel": 2,
+    "libraryDir": ".pi/harness/library",   // absolute or repo-relative
+    "worktreeRoot": ".pi/harness/worktrees",
+    "keepRuns": 20,              // run dirs kept under .pi/harness/runs (pending adoptions are never pruned)
     "stageTimeoutMs": 600000,
-    "forbiddenGlobs": []          // replaces defaults when non-empty
+    "budgets": {},               // per-key overrides on the active profile
+    "forbiddenGlobs": []         // replaces defaults when non-empty
   }
 }
 ```
@@ -235,6 +297,34 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
   validator error → fallback to the current surface (counted in the ledger).
 - **Fail open** only at selection (judge unavailable → pick `c0`, recorded),
   because refusing selection cannot corrupt a grader.
+- **Interruption**: `/rsi-stop` interrupts the run before its normal end. In
+  the session that owns the run, the current child-`pi` call is SIGTERMed; from
+  another session (headless runs included) it writes a `STOP` sentinel into the
+  run dir. Either way the loop checks the stop signal at every stage boundary
+  and closes with outcome `aborted` — nothing half-applied, evidence and
+  candidates stay under the run dir, and no adoption happens. `/rsi-watch`
+  (optionally `--follow`) shows the live stage, spend and notes, with a
+  ledger-backed disk view for runs started in another session.
+- **Retention**: each new run prunes run dirs beyond `rsi.keepRuns` — but only
+  runs that are old *and* decided; anything awaiting `/rsi-adopt` (and the
+  in-flight run) is never deleted, so the raw evidence a lesson came from
+  stays repairable.
+- **One run per project (cross-process lock)**: the in-process registry only
+  sees this `pi` session, so every run also takes `.pi/harness/run.lock`
+  (pid + run id + host). A second session — or a headless `pi --print` — refuses
+  to start while a live lock exists, and `/rsi-adopt` takes the same lock before
+  touching the tree. A lock whose pid is dead, is older than 12 h, or is
+  unreadable is ignored (fail open), so a crashed run never wedges the project.
+- **Delta-only validation**: `readSurface` snapshots what is already in the
+  tree; candidates are validated as `base ⊕ delta` and `validate(base, candidate)`
+  reports only the errors/warnings the proposal *adds* — a hostile script or
+  tripwire phrase that already exists in the host tree is inherited, not
+  re-litigated on every proposal. The tripwire boundary is about what a
+  proposal adds or rewrites, not a full audit of the host project.
+- **Matched conditions**: clean git trees probe a detached worktree at `HEAD`;
+  a dirty tree (only reachable with `--force`) or a non-git project probes a
+  byte-faithful copy of the live tree instead, so rollouts always measure the
+  surface that was snapshotted rather than a stale checkout.
 - Every run writes `.pi/harness/runs/<id>/`: `ledger.json`, `report.json`,
   `status.txt`, missions, digests, evidence (sessions + rollouts), candidate
   surfaces, `selection.json`. Library: `.pi/harness/library/<domain>/<slug>/`
@@ -244,13 +334,17 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
 
 ```bash
 bun install          # dev deps (types only)
-bun test             # 49 tests, includes full fake loops for k=1 and k=2 (PI_RSI_FAKE=1)
+bun test             # full suite, includes fake loops for k=1 and k=2 (PI_RSI_FAKE=1)
 bun run typecheck    # tsc --noEmit, strict
+bun run lint         # Biome: lint + format check (bun run format to fix)
 PI_RSI_FAKE=1 pi --offline -ne -e ./index.ts --print "/rsi --domain demo <task>"   # zero-cost e2e
 ```
 
-Layout: `index.ts` (commands) · `src/loop.ts` (orchestration) · `src/context.ts`
-(budget choke point) · `src/surface.ts` (whitelist + validation) · `src/guard.ts`
-(tripwires/gates) · `src/trajectory.ts` (digests) · `src/editor.ts` (missions,
-reply parsing) · `src/selection.ts` · `src/library.ts` · `src/ledger.ts` ·
-`src/probe.ts` · `src/worktree.ts` · `src/fake.ts`.
+Layout: `index.ts` (commands) · `src/loop.ts` (orchestration) · `src/watch.ts`
+(live run registry: `/rsi-watch`, `/rsi-stop`) · `src/lock.ts` (cross-process
+run lock) · `src/context.ts` (budget choke point) · `src/surface.ts` (whitelist +
+validation + gate review) · `src/guard.ts` (tripwires/script scan/gates) ·
+`src/trajectory.ts` (digests) · `src/editor.ts` (missions, reply parsing) ·
+`src/selection.ts` · `src/library.ts` (lessons, supersession) · `src/ledger.ts` ·
+`src/probe.ts` · `src/retention.ts` (run pruning) · `src/runs.ts` (run discovery) ·
+`src/worktree.ts` · `src/fake.ts`.

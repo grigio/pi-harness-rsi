@@ -9,8 +9,8 @@
 
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
-import { listFiles, readTextIf, seedFromString, seededShuffle, truncateMiddle, writeText } from "./util";
 import type { ProbeResult } from "./probe";
+import { listFiles, readTextIf, seededShuffle, seedFromString, truncateMiddle, writeText } from "./util";
 
 export interface Candidate {
 	/** Anonymized id shown to the selector (`c0`, `c1`, …). */
@@ -41,12 +41,7 @@ export function selectionSeed(runId: string): number {
 }
 
 /** Build the anonymized pool (deterministic for a given run id). */
-export function buildPool(
-	finals: readonly ProbeResult[],
-	runDir: string,
-	cfg: RsiConfig,
-	seed: number,
-): Candidate[] {
+export function buildPool(finals: readonly ProbeResult[], runDir: string, cfg: RsiConfig, seed: number): Candidate[] {
 	const shuffled = seededShuffle(
 		finals.map((f) => f.label),
 		seed,
@@ -59,7 +54,7 @@ export function buildPool(
 	}));
 }
 
-export function renderCandidates(pool: readonly Candidate[], cfg: RsiConfig): string[] {
+export function renderCandidates(pool: readonly Candidate[]): string[] {
 	return pool.map(
 		(c) =>
 			`### ${c.id}  (files: ${c.deliverableCount || "none"})\n` +
@@ -76,16 +71,6 @@ export interface SelectionResult {
 
 export function saveSelection(runDir: string, record: SelectionRecord): void {
 	writeText(join(runDir, "selection.json"), JSON.stringify(record, null, "\t"));
-}
-
-export function loadSelection(runDir: string): SelectionRecord | undefined {
-	const text = readTextIf(join(runDir, "selection.json"));
-	if (!text) return undefined;
-	try {
-		return JSON.parse(text) as SelectionRecord;
-	} catch {
-		return undefined;
-	}
 }
 
 /** First candidate in the pool — the fail-open default when selection fails. */
@@ -112,9 +97,7 @@ function deliverableExcerpt(runDir: string, label: string, cfg: RsiConfig): stri
 	const files = deliverableFiles(runDir, label);
 	if (files.length === 0) {
 		const digestText = readTextIf(join(runDir, "digests", `${label}.md`));
-		return digestText
-			? `${truncateMiddle(digestText, budget)}`
-			: "(no deliverable recorded for this candidate)";
+		return digestText ? `${truncateMiddle(digestText, budget)}` : "(no deliverable recorded for this candidate)";
 	}
 	const perFile = Math.max(200, Math.floor(budget / files.length));
 	const parts: string[] = [];

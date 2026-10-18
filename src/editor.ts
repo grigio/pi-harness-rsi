@@ -14,10 +14,11 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RsiConfig } from "./config";
-import { assemble, budgetFor, capNotes, type AssembledMission, type MissionPart } from "./context";
-import { fakeEditorReply, type FakeEditorContext, type FakeStage } from "./fake";
-import { findSessionFile, spawnPi, buildChildArgs } from "./probe";
-import { renderFileMap, summarizeDiff, type Surface, type SurfaceDelta, type SurfaceDiff } from "./surface";
+import { type AssembledMission, assemble, budgetFor, capNotes, type MissionPart } from "./context";
+import { type FakeEditorContext, type FakeStage, fakeEditorReply } from "./fake";
+import { buildChildArgs, findSessionFile, spawnPi } from "./probe";
+import { renderFileMap, type Surface, type SurfaceDelta, type SurfaceDiff, summarizeDiff } from "./surface";
+import { sessionUsd } from "./trajectory";
 import { extractTag, readTextIf, stripFence, writeText } from "./util";
 
 export type EditorStage = "propose-inv" | "propose-dom" | "compose" | "select" | "reflect";
@@ -56,7 +57,7 @@ export function replyRules(stage: EditorStage, cfg: RsiConfig): string {
 	return [
 		"Reply format (exact):",
 		`- <notes>…</notes> with at most ${notes} characters (decision rationale),`,
-		"- then one fenced ```json block containing {\"files\": [ {\"path\": …, \"op\": \"write\"|\"delete\", \"content\": …} ]}.",
+		'- then one fenced ```json block containing {"files": [ {"path": …, "op": "write"|"delete", "content": …} ]}.',
 		"Rules:",
 		"- Emit only changed files (omitted-is-inherited): the applied surface is current ⊕ your delta.",
 		"- Paths must be inside the surface: AGENTS.md, .pi/prompts/<name>.md, .pi/skills/<name>/SKILL.md, .pi/skills/<name>/scripts/**.",
@@ -97,7 +98,8 @@ function fallbackLever(header: string): string {
 	const levers: Record<string, string> = {
 		INV: "Edit procedure only (AGENTS.md): ordered, imperative steps that would have prevented the observed failures.",
 		DOM: "Edit practitioner knowledge only (a .pi/skills/<name>/ skill) and name it in AGENTS.md.",
-		COMPOSE: "Merge the contrastive digests: keep what the evidence supports, drop unmotivated advice, do not duplicate rules.",
+		COMPOSE:
+			"Merge the contrastive digests: keep what the evidence supports, drop unmotivated advice, do not duplicate rules.",
 		SELECT: "Pick the deliverable that best satisfies the task; names and identities are withheld.",
 		REFLECT: "Write cue/lesson/evidence/confidence from disk evidence, or reply <experience>none</experience>.",
 	};
@@ -151,11 +153,13 @@ export function proposeParts(stage: EditorStage, inputs: MissionInputs, cfg: Rsi
 		parts.push({ name: "reference digests", text: inputs.digests.join("\n\n") });
 	}
 	if (inputs.carry) parts.push({ name: "carried notes", text: inputs.carry });
-	if (inputs.libraryIndex) {
-		parts.push({ name: "library index", text: inputs.libraryIndex, optional: true });
-	}
+	// Optional parts are declared best-first: `assemble()` drops from the tail,
+	// so the index (a summary of the lessons) is sacrificed before the lessons.
 	if (inputs.libraryLessons && inputs.libraryLessons.length > 0) {
 		parts.push({ name: "library lessons", text: joinLessons(inputs.libraryLessons), optional: true });
+	}
+	if (inputs.libraryIndex) {
+		parts.push({ name: "library index", text: inputs.libraryIndex, optional: true });
 	}
 	return parts;
 }
@@ -181,9 +185,12 @@ export function composeParts(inputs: ComposeInputs, cfg: RsiConfig): MissionPart
 		parts.push({ name: "decision notes", text: inputs.decisionNotes.join("\n") });
 	}
 	if (inputs.carry) parts.push({ name: "carried notes", text: inputs.carry, optional: true });
-	if (inputs.libraryIndex) parts.push({ name: "library index", text: inputs.libraryIndex, optional: true });
+	// Best-first (see proposeParts): over budget, the index goes before the lessons.
 	if (inputs.libraryLessons && inputs.libraryLessons.length > 0) {
 		parts.push({ name: "library lessons", text: joinLessons(inputs.libraryLessons), optional: true });
+	}
+	if (inputs.libraryIndex) {
+		parts.push({ name: "library index", text: inputs.libraryIndex, optional: true });
 	}
 	return parts;
 }
@@ -231,7 +238,6 @@ function joinLessons(lessons: readonly string[]): string {
 
 /** Assemble + persist a mission (characterization artifacts live in `missions/`). */
 export function buildMission(
-	stage: EditorStage,
 	missionStage: "propose" | "compose" | "reflect" | "select",
 	parts: MissionPart[],
 	cfg: RsiConfig,
@@ -267,24 +273,30 @@ export function parseEdits(reply: string, cfg: RsiConfig): ParsedEdits {
 	try {
 		parsed = JSON.parse(stripFence(jsonPayload));
 	} catch (err) {
-		throw new ReplyParseError(`edits block is not valid JSON: ${(err as Error).message} — reply with a single {"files": [...]} object`);
+		throw new ReplyParseError(
+			`edits block is not valid JSON: ${(err as Error).message} — reply with a single {"files": [...]} object`,
+		);
 	}
 	const obj = parsed as { files?: unknown; notes?: unknown };
 	if (!obj || !Array.isArray(obj.files)) {
-		throw new ReplyParseError(`edits JSON must be an object with a "files" array — got ${JSON.stringify(parsed).slice(0, 200)}`);
+		throw new ReplyParseError(
+			`edits JSON must be an object with a "files" array — got ${JSON.stringify(parsed).slice(0, 200)}`,
+		);
 	}
 	const files: SurfaceDelta["files"] = [];
 	for (const entry of obj.files) {
 		const e = entry as { path?: unknown; op?: unknown; content?: unknown };
 		if (typeof e?.path !== "string" || (e.op !== "write" && e.op !== "delete")) {
-			throw new ReplyParseError(`invalid file entry ${JSON.stringify(entry).slice(0, 160)} — each entry needs {"path": string, "op": "write"|"delete", "content"?: string}`);
+			throw new ReplyParseError(
+				`invalid file entry ${JSON.stringify(entry).slice(0, 160)} — each entry needs {"path": string, "op": "write"|"delete", "content"?: string}`,
+			);
 		}
 		if (e.op === "write" && typeof e.content !== "string") {
 			throw new ReplyParseError(`file entry "${e.path}" has op "write" without string content`);
 		}
 		files.push({ path: e.path, op: e.op, ...(e.op === "write" ? { content: e.content as string } : {}) });
 	}
-	const notes = capNotes(typeof obj.notes === "string" ? obj.notes : extractTag(reply, "notes") ?? "", cfg.budgets);
+	const notes = capNotes(typeof obj.notes === "string" ? obj.notes : (extractTag(reply, "notes") ?? ""), cfg.budgets);
 	return { notes, delta: { files, notes } };
 }
 
@@ -379,7 +391,7 @@ export async function runEditor(opts: RunEditorOptions): Promise<EditorRun> {
 	});
 	const run = await spawnPi(args, { cwd: runDir, cfg, signal: opts.signal });
 	const sessionFile = findSessionFile(sessionDir);
-	const jsonl = sessionFile ? readTextIf(sessionFile) ?? "" : "";
+	const jsonl = sessionFile ? (readTextIf(sessionFile) ?? "") : "";
 	const reply = finalAssistantText(jsonl);
 
 	if (run.code !== 0 && reply.length === 0) {
@@ -393,22 +405,7 @@ export async function runEditor(opts: RunEditorOptions): Promise<EditorRun> {
 			missionPath: opts.missionPath,
 		};
 	}
-	return { ok: true, reply, usd: usdOfSession(jsonl), wallMs: run.wallMs, mission, missionPath: opts.missionPath };
-}
-
-function usdOfSession(jsonl: string): number {
-	let total = 0;
-	for (const line of jsonl.split("\n")) {
-		if (line.trim().length === 0) continue;
-		try {
-			const entry = JSON.parse(line) as { type: string; message?: { usage?: { cost?: { total?: number } } }; usage?: { cost?: { total?: number } } };
-			const cost = entry.message?.usage?.cost?.total ?? (entry.type === "usage" ? entry.usage?.cost?.total : undefined);
-			if (typeof cost === "number") total += cost;
-		} catch {
-			// ignore malformed lines
-		}
-	}
-	return total;
+	return { ok: true, reply, usd: sessionUsd(jsonl), wallMs: run.wallMs, mission, missionPath: opts.missionPath };
 }
 
 /** Last assistant text block — the editor's answer. */
@@ -440,5 +437,5 @@ export function finalAssistantText(jsonl: string): string {
 	return last;
 }
 
-export { budgetFor, summarizeDiff };
 export type { SurfaceDiff };
+export { budgetFor, summarizeDiff };

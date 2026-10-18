@@ -13,11 +13,11 @@
  */
 
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
-import { ensureDir, listFiles, readTextIf, rmrf, toPosix, writeText } from "./util";
-import { writeSurface, type Surface } from "./surface";
+import { type Surface, writeSurface } from "./surface";
+import { copyDir, ensureDir, readTextIf, rmrf, writeText } from "./util";
 
 export type SandboxKind = "worktree" | "copy";
 
@@ -34,11 +34,13 @@ export interface Sandbox {
 
 export function isGitRepo(root: string): boolean {
 	try {
-		return execSync("git rev-parse --is-inside-work-tree", {
-			cwd: root,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim() === "true";
+		return (
+			execSync("git rev-parse --is-inside-work-tree", {
+				cwd: root,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim() === "true"
+		);
 	} catch {
 		return false;
 	}
@@ -52,7 +54,7 @@ export function ensureHarnessIgnored(repoRoot: string): void {
 	const dir = join(repoRoot, ".pi", "harness");
 	ensureDir(dir);
 	const gitignore = join(dir, ".gitignore");
-	if (readTextIf(gitignore) !== "worktrees/\nruns/\n") writeText(gitignore, "worktrees/\nruns/\n");
+	if (readTextIf(gitignore) !== "worktrees/\nruns/\nrun.lock\n") writeText(gitignore, "worktrees/\nruns/\nrun.lock\n");
 }
 
 /** Resolved sandbox root inside the repo (relative settings resolve from the repo). */
@@ -63,8 +65,12 @@ export function worktreeRootPath(repoRoot: string, cfg: Pick<RsiConfig, "worktre
 export interface PrepareOptions {
 	/** Unique per rollout — the sandbox lives at `<worktreeRoot>/<id>`. */
 	id: string;
-	/** Skip the dirty-tree refusal (only reachable via `/rsi --force`). */
-	force?: boolean;
+	/**
+	 * Copy the live tree instead of checking out HEAD. Required whenever the
+	 * live tree may differ from HEAD (dirty tree with `--force`, or a non-git
+	 * project), so the solver probes exactly the surface that was snapshotted.
+	 */
+	forceCopy?: boolean;
 	/** Non-git fallback: copy this tree instead of a worktree checkout. */
 	copySource?: string;
 }
@@ -79,7 +85,7 @@ export function prepareSandbox(repoRoot: string, cfg: RsiConfig, opts: PrepareOp
 	const path = join(root, opts.id);
 	rmrf(path);
 
-	if (isGitRepo(repoRoot)) {
+	if (!opts.forceCopy && isGitRepo(repoRoot)) {
 		try {
 			execFileSync("git", ["worktree", "add", "--detach", path, "HEAD"], {
 				cwd: repoRoot,
@@ -94,8 +100,7 @@ export function prepareSandbox(repoRoot: string, cfg: RsiConfig, opts: PrepareOp
 
 	const source = opts.copySource ?? repoRoot;
 	ensureDir(path);
-	// copyDir is imported lazily to keep the hot path (worktree) allocation-free
-	copyTreeSync(source, path);
+	copyDir(source, path, { excludeDirs: COPY_EXCLUDES, maxFiles: 20000 });
 	return makeCopySandbox(path);
 }
 
@@ -167,13 +172,6 @@ function makeCopySandbox(path: string): Sandbox {
 	};
 }
 
-function copyTreeSync(src: string, dst: string): void {
-	const files = listFiles(src, { excludeDirs: COPY_EXCLUDES, maxFiles: 20000 });
-	for (const rel of files) {
-		writeText(join(dst, rel), readTextIf(join(src, rel)) ?? "");
-	}
-}
-
 export interface VerifierEvidence {
 	/** `cmd exit=N; tail: …` — behavioural evidence, never a score. */
 	line: string;
@@ -185,7 +183,10 @@ export interface VerifierEvidence {
  * The editor is never shown a score target (P5): this is what happened when the
  * artifact ran, not what the grader wants.
  */
-export function runVerifier(sandboxPath: string, cfg: Pick<RsiConfig, "verifier" | "stageTimeoutMs">): VerifierEvidence | undefined {
+export function runVerifier(
+	sandboxPath: string,
+	cfg: Pick<RsiConfig, "verifier" | "stageTimeoutMs">,
+): VerifierEvidence | undefined {
 	if (!cfg.verifier) return undefined;
 	try {
 		const out = execSync(cfg.verifier, {
@@ -210,16 +211,59 @@ function tailOf(text: string, max = 300): string {
 	return `; tail: "${clean.slice(-max)}"`;
 }
 
-/** Absolute path of the live tree's harness run/library root. */
-export function harnessRoot(repoRoot: string): string {
-	return join(repoRoot, ".pi", "harness");
+/**
+ * Stale sandbox dirs older than this are removed at run start. Long enough to
+ * outlive a hung but still-live run, short enough to reclaim crashed ones.
+ */
+const STALE_SANDBOX_MS = 6 * 60 * 60 * 1000;
+
+export interface CleanupResult {
+	/** Orphaned `<worktreeRoot>/*` directories removed. */
+	dirs: number;
+	/** Whether `git worktree prune` ran (repo only). */
+	worktreePruned: boolean;
 }
 
-export function relFrom(root: string, target: string): string {
-	const rel = toPosix(target.startsWith(root) ? target.slice(root.length).replace(/^\/+/, "") : target);
-	return rel;
-}
+/**
+ * Reclaim sandboxes a crashed run leaked: `git worktree prune` clears admin
+ * entries whose dirs are gone; orphan dirs under the worktree root older than
+ * `STALE_SANDBOX_MS` (and not the active id) are removed. Best-effort — cleanup
+ * must never block a run.
+ */
+export function cleanupSandboxes(
+	repoRoot: string,
+	cfg: Pick<RsiConfig, "worktreeRoot" | "stageTimeoutMs">,
+	opts: { protect?: readonly string[]; staleMs?: number } = {},
+): CleanupResult {
+	const protect = new Set(opts.protect ?? []);
+	const staleMs = opts.staleMs ?? Math.max(STALE_SANDBOX_MS, cfg.stageTimeoutMs * 2);
+	let worktreePruned = false;
+	if (isGitRepo(repoRoot)) {
+		try {
+			execFileSync("git", ["worktree", "prune"], { cwd: repoRoot, stdio: ["ignore", "ignore", "ignore"] });
+			worktreePruned = true;
+		} catch {
+			// best-effort
+		}
+	}
 
-export function sandboxExists(path: string): boolean {
-	return existsSync(path);
+	const root = worktreeRootPath(repoRoot, cfg);
+	let dirs = 0;
+	if (!existsSync(root)) return { dirs, worktreePruned };
+	try {
+		for (const entry of readdirSync(root, { withFileTypes: true })) {
+			if (!entry.isDirectory() || protect.has(entry.name)) continue;
+			const path = join(root, entry.name);
+			try {
+				if (Date.now() - statSync(path).mtimeMs < staleMs) continue;
+			} catch {
+				continue;
+			}
+			rmrf(path);
+			dirs++;
+		}
+	} catch {
+		// root disappeared mid-scan — nothing to do
+	}
+	return { dirs, worktreePruned };
 }

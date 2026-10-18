@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { BudgetError, assemble, budgetFor, capNotes } from "../src/context";
-import { PROFILES } from "../src/config";
+import { PROFILES, resolveConfig } from "../src/config";
+import { assemble, assembleStrict, BudgetError, budgetFor, capNotes } from "../src/context";
+import { type ComposeInputs, composeParts, type MissionInputs, proposeParts } from "../src/editor";
 
 const small = PROFILES.small;
 
@@ -67,6 +68,33 @@ describe("context.assemble — the budget choke point", () => {
 		expect(mission.used).toBeLessThanOrEqual(small.reflectMission);
 	});
 
+	test("optional parts never raise, even when the drop-notice itself will not fit", () => {
+		const budget = small.proposeMission;
+		// Mandatory content already fills nearly the whole budget, so the dropped
+		// part's own notice cannot be appended — optional content must still never fail the stage.
+		const mission = assemble(
+			"propose",
+			[
+				{ name: "task", text: "x".repeat(budget - 40) },
+				{ name: "library lessons", text: "y".repeat(5_000), optional: true },
+			],
+			small,
+		);
+		expect(mission.used).toBeLessThanOrEqual(mission.budget);
+		expect(mission.dropped).toContain("library lessons");
+		expect(mission.text).not.toContain("library lessons");
+		expect(mission.text).not.toContain("yyyyyyyyyy");
+	});
+
+	test("assembleStrict promotes optional parts to mandatory (they then raise when over budget)", () => {
+		const parts = [
+			{ name: "task", text: "t" },
+			{ name: "library index", text: "z".repeat(small.proposeMission), optional: true },
+		];
+		expect(assemble("propose", parts, small).dropped).toEqual(["library index"]);
+		expect(() => assembleStrict("propose", parts, small)).toThrow(BudgetError);
+	});
+
 	test("per-stage budgets come from the profile", () => {
 		expect(budgetFor("propose", small)).toBe(small.proposeMission);
 		expect(budgetFor("compose", small)).toBe(small.composeMission);
@@ -81,5 +109,34 @@ describe("context.assemble — the budget choke point", () => {
 		expect(capped.endsWith("…")).toBe(true);
 		const short = capNotes("short note", small);
 		expect(short).toBe("short note");
+	});
+});
+
+describe("mission eviction order — best optional parts declared first", () => {
+	const cfg = resolveConfig({ profile: "small" }, {} as NodeJS.ProcessEnv);
+	const inputs: MissionInputs = {
+		task: "run the verifier after every edit",
+		domain: "demo",
+		surface: { "AGENTS.md": "# demo" },
+		evidence: [],
+		digests: [],
+		libraryIndex: "INDEX",
+		libraryLessons: ["lesson body"],
+	};
+
+	test("proposeParts declares library lessons before the index (assemble drops from the tail)", () => {
+		const parts = proposeParts("propose-inv", inputs, cfg);
+		const lessons = parts.findIndex((p) => p.name === "library lessons");
+		const index = parts.findIndex((p) => p.name === "library index");
+		expect(lessons).toBeGreaterThan(-1);
+		expect(index).toBeGreaterThan(lessons);
+	});
+
+	test("composeParts declares library lessons before the index", () => {
+		const parts = composeParts({ ...inputs, contrast: [], decisionNotes: [] } satisfies ComposeInputs, cfg);
+		const lessons = parts.findIndex((p) => p.name === "library lessons");
+		const index = parts.findIndex((p) => p.name === "library index");
+		expect(lessons).toBeGreaterThan(-1);
+		expect(index).toBeGreaterThan(lessons);
 	});
 });

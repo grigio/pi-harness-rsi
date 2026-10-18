@@ -9,7 +9,7 @@
  * sections are dropped lowest-priority-first instead of being sliced mid-line.
  */
 
-import { charLen, truncateMiddle, truncateEnd } from "./util";
+import { charLen, truncateEnd, truncateMiddle } from "./util";
 
 export interface SessionMessage {
 	role: string;
@@ -124,7 +124,12 @@ export function summarizeSession(jsonl: string): SessionSummary {
 
 	// Aborted calls (no result) still belong to the timeline.
 	for (const orphan of pending.values()) {
-		steps.push({ tool: orphan.tool, call: orphan.call, isError: true, brief: "<no result: run ended before this call returned>" });
+		steps.push({
+			tool: orphan.tool,
+			call: orphan.call,
+			isError: true,
+			brief: "<no result: run ended before this call returned>",
+		});
 	}
 
 	return { models: [...models], steps, turns, usd, totalTokens };
@@ -226,7 +231,8 @@ export function digest(input: DigestInput): DigestResult {
 
 	// rework
 	const dup = longestDuplicateRun(summary.steps);
-	const rework = dup && dup.length >= 2 ? `rework: ${dup.length} consecutive identical ${dup.tool} calls` : "rework: none";
+	const rework =
+		dup && dup.length >= 2 ? `rework: ${dup.length} consecutive identical ${dup.tool} calls` : "rework: none";
 
 	// deliverable + verifier (evidence, not score)
 	const deliverable =
@@ -236,7 +242,9 @@ export function digest(input: DigestInput): DigestResult {
 			: input.diffStat
 				? `deliverable: git-diff: ${input.diffStat}`
 				: "deliverable: none recorded";
-	const verifier = input.verifier ? `verifier: ${truncateMiddle(input.verifier.replace(/\s+/g, " ").trim(), 400)}` : undefined;
+	const verifier = input.verifier
+		? `verifier: ${truncateMiddle(input.verifier.replace(/\s+/g, " ").trim(), 400)}`
+		: undefined;
 	const pointer = input.pointer ? `full session: ${input.pointer}` : undefined;
 
 	// Priority order: header, tools, errors, deliverable, verifier, divergence, rework, pointer.
@@ -325,11 +333,11 @@ export function writtenPaths(jsonl: string, allowedPrefixes: readonly string[] =
 		} catch {
 			continue;
 		}
-		if (!entry.message || entry.message.role !== "assistant") continue;
+		if (entry.message?.role !== "assistant") continue;
 		const content = entry.message.content;
 		if (!Array.isArray(content)) continue;
 		for (const block of content) {
-			if (!block || block.type !== "toolCall") continue;
+			if (block?.type !== "toolCall") continue;
 			if (block.name !== "write" && block.name !== "edit") continue;
 			const args = (block.arguments ?? {}) as { path?: string; file_path?: string };
 			const path = args.path ?? args.file_path;
@@ -345,6 +353,6 @@ export function writtenPaths(jsonl: string, allowedPrefixes: readonly string[] =
 function briefOf(args: unknown): string {
 	if (!args || typeof args !== "object") return "";
 	const a = args as Record<string, unknown>;
-	const key = typeof a["command"] === "string" ? a["command"] : typeof a["path"] === "string" ? a["path"] : JSON.stringify(a);
+	const key = typeof a.command === "string" ? a.command : typeof a.path === "string" ? a.path : JSON.stringify(a);
 	return String(key).slice(0, 200);
 }

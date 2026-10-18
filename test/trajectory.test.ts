@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { digest, sessionUsd, summarizeSession, writtenPaths } from "../src/trajectory";
-import { findSessionFile, listSessionFiles } from "../src/probe";
 import { fakeSessionJsonl } from "../src/fake";
+import { findSessionFile } from "../src/probe";
+import { digest, sessionUsd, summarizeSession, writtenPaths } from "../src/trajectory";
 
 /** Minimal, faithful pi session JSONL (see docs/session-format.md). */
 function jsonl(entries: unknown[]): string {
-	return entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+	return `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 }
 
 const withCall = jsonl([
@@ -117,7 +117,10 @@ test("summarizeSession: turns, models, steps, orphans", () => {
 	expect(s.steps[0]?.isError).toBe(true);
 	// an assistant call with no toolResult still appears (aborted run)
 	const orphan = jsonl([
-		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "z", name: "bash", arguments: {} }] } },
+		{
+			type: "message",
+			message: { role: "assistant", content: [{ type: "toolCall", id: "z", name: "bash", arguments: {} }] },
+		},
 	]);
 	expect(summarizeSession(orphan).steps).toHaveLength(1);
 	expect(summarizeSession(orphan).steps[0]?.isError).toBe(true);
@@ -130,12 +133,11 @@ test("writtenPaths harvests deliverables from edit tools", () => {
 });
 
 describe("session discovery for evidence", () => {
-	test("findSessionFile / listSessionFiles walk the evidence tree", () => {
+	test("findSessionFile walks the evidence tree", () => {
 		const dir = mkdtempSync(join(tmpdir(), "rsi-ev-"));
 		mkdirSync(join(dir, "sessions"), { recursive: true });
 		writeFileSync(join(dir, "sessions", "one.jsonl"), "{}\n");
 		expect(findSessionFile(dir)).toBe(join(dir, "sessions", "one.jsonl"));
-		expect(listSessionFiles(dir)).toEqual([join("sessions", "one.jsonl")]);
 		expect(findSessionFile(mkdtempSync(join(tmpdir(), "rsi-ev2-")))).toBeUndefined();
 	});
 

@@ -6,7 +6,17 @@
  */
 
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	type Dirent,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 
 /** Character count (Unicode code points). Budgets are chars, not UTF-16 units. */
@@ -73,13 +83,21 @@ export interface ListOptions {
 /** Recursive file listing, posix-relative, sorted. Directories first-class excluded by name. */
 export function listFiles(root: string, opts: ListOptions = {}): string[] {
 	const excludeDirs = new Set(opts.excludeDirs ?? []);
+	// Multi-segment entries (e.g. `.pi/harness`) cannot match a directory name;
+	// match them against the repo-relative path so nested trees really are skipped.
+	const excludeScoped = [...excludeDirs].filter((d) => d.includes("/"));
 	const excludePaths = new Set(opts.excludePaths ?? []);
 	const maxFiles = opts.maxFiles ?? 20000;
 	const out: string[] = [];
 
+	const excludedDir = (name: string, rel: string): boolean => {
+		if (excludeDirs.has(name)) return true;
+		return excludeScoped.some((d) => rel === d || rel.startsWith(`${d}/`));
+	};
+
 	const walk = (dir: string): void => {
 		if (out.length >= maxFiles) return;
-		let entries;
+		let entries: Dirent[];
 		try {
 			entries = readdirSync(dir, { withFileTypes: true });
 		} catch {
@@ -91,7 +109,7 @@ export function listFiles(root: string, opts: ListOptions = {}): string[] {
 			const rel = toPosix(relative(root, abs));
 			if (excludePaths.has(rel)) continue;
 			if (entry.isDirectory()) {
-				if (excludeDirs.has(entry.name)) continue;
+				if (excludedDir(entry.name, rel)) continue;
 				walk(abs);
 			} else if (entry.isFile()) {
 				out.push(rel);
@@ -278,7 +296,11 @@ export function fileSize(path: string): number {
 }
 
 /** Run `fn` over `items` with at most `limit` in flight (maxParallel). */
-export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+export async function mapLimit<T, R>(
+	items: readonly T[],
+	limit: number,
+	fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
 	const results: R[] = new Array(items.length);
 	let next = 0;
 	const workers = new Array(Math.max(1, Math.min(limit, items.length))).fill(0).map(async () => {

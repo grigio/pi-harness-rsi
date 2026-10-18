@@ -10,14 +10,14 @@
  * session so the whole loop runs with zero model calls.
  */
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
-import { digest, sessionUsd, summarizeSession, writtenPaths } from "./trajectory";
-import { ensureDir, listFiles, readTextIf, rmrf, toPosix, writeText } from "./util";
-import { runVerifier, type Sandbox } from "./worktree";
 import { fakeSessionJsonl } from "./fake";
+import { digest, sessionUsd, writtenPaths } from "./trajectory";
+import { ensureDir, readTextIf, relPosix, rmrf, toPosix, writeText } from "./util";
+import { runVerifier, type Sandbox } from "./worktree";
 
 export interface ChildRun {
 	code: number;
@@ -34,7 +34,7 @@ function childEnv(cfg: RsiConfig): NodeJS.ProcessEnv {
 	for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
 		delete env[key];
 	}
-	if (cfg.fake) env["PI_RSI_FAKE"] = "1";
+	if (cfg.fake) env.PI_RSI_FAKE = "1";
 	return env;
 }
 
@@ -55,8 +55,30 @@ export function buildChildArgs(opts: {
 	return args;
 }
 
-/** Spawn `pi` (or `PI_RSI_PI_BIN`) and collect its JSONL stdout. */
-export function spawnPi(args: string[], opts: { cwd: string; cfg: RsiConfig; signal?: AbortSignal }): Promise<ChildRun> {
+/**
+ * SIGTERM the whole child process group — `child.kill()` only signals the
+ * direct child, so a sandbox `pi` that spawned bash/tool grandchildren would
+ * survive a timeout or `/rsi-stop`. `detached: true` (POSIX) makes the child a
+ * group leader, so `-pid` reaches the tree; the fallback covers platforms that
+ * reject negative pids.
+ */
+function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
+	if (child.pid === undefined) return;
+	try {
+		process.kill(-child.pid, signal);
+	} catch {
+		try {
+			child.kill(signal);
+		} catch {
+			// already gone
+		}
+	}
+}
+
+export function spawnPi(
+	args: string[],
+	opts: { cwd: string; cfg: RsiConfig; signal?: AbortSignal },
+): Promise<ChildRun> {
 	const bin = process.env.PI_RSI_PI_BIN ?? "pi";
 	const started = Date.now();
 	return new Promise((resolve) => {
@@ -69,18 +91,25 @@ export function spawnPi(args: string[], opts: { cwd: string; cfg: RsiConfig; sig
 			cwd: opts.cwd,
 			env: childEnv(opts.cfg),
 			stdio: ["ignore", "pipe", "pipe"],
+			detached: process.platform !== "win32",
 		});
 
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const timer = setTimeout(() => {
 			killed = true;
-			child.kill("SIGKILL");
+			killTree(child, "SIGTERM");
+			// Escalate if the group ignores SIGTERM.
+			killTimer = setTimeout(() => killTree(child, "SIGKILL"), 5_000);
 		}, opts.cfg.stageTimeoutMs);
 
 		const onAbort = (): void => {
 			killed = true;
-			child.kill("SIGTERM");
+			killTree(child, "SIGTERM");
 		};
-		opts.signal?.addEventListener("abort", onAbort, { once: true });
+		// The signal may already be aborted by the time we spawn (stop during
+		// sandbox setup): an `addEventListener` after the fact never fires.
+		if (opts.signal?.aborted) onAbort();
+		else opts.signal?.addEventListener("abort", onAbort, { once: true });
 
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
@@ -95,6 +124,7 @@ export function spawnPi(args: string[], opts: { cwd: string; cfg: RsiConfig; sig
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			if (killTimer) clearTimeout(killTimer);
 			opts.signal?.removeEventListener("abort", onAbort);
 			resolve({ code, stdout, stderr, wallMs: Date.now() - started, killed, error });
 		};
@@ -107,18 +137,12 @@ export function spawnPi(args: string[], opts: { cwd: string; cfg: RsiConfig; sig
 /** Newest `.jsonl` under a session dir (pi names files `<timestamp>_<id>.jsonl`). */
 export function findSessionFile(sessionDir: string): string | undefined {
 	if (!existsDir(sessionDir)) return undefined;
-	const files: Array<{ path: string; mtime: number }> = [];
+	const files: string[] = [];
 	const walk = (dir: string): void => {
 		for (const entry of readdirSync(dir, { withFileTypes: true })) {
 			const abs = join(dir, entry.name);
 			if (entry.isDirectory()) walk(abs);
-			else if (entry.name.endsWith(".jsonl")) {
-				try {
-					files.push({ path: abs, mtime: Date.now() });
-				} catch {
-					// ignore
-				}
-			}
+			else if (entry.name.endsWith(".jsonl")) files.push(abs);
 		}
 	};
 	try {
@@ -126,16 +150,7 @@ export function findSessionFile(sessionDir: string): string | undefined {
 	} catch {
 		return undefined;
 	}
-	// mtime ordering: stat lazily
-	return files
-		.map((f) => {
-			try {
-				return { path: f.path, mtime: statMtime(f.path) };
-			} catch {
-				return { path: f.path, mtime: 0 };
-			}
-		})
-		.sort((a, b) => b.mtime - a.mtime)[0]?.path;
+	return files.sort((a, b) => statMtime(b) - statMtime(a))[0];
 }
 
 function statMtime(path: string): number {
@@ -177,7 +192,12 @@ export interface ProbeResult {
 }
 
 /** Evidence root inside the run dir (pointers go into missions from here). */
-export function evidencePaths(runDir: string): { rollouts: string; deliverables: string; digests: string; sessions: string } {
+export function evidencePaths(runDir: string): {
+	rollouts: string;
+	deliverables: string;
+	digests: string;
+	sessions: string;
+} {
 	return {
 		rollouts: join(runDir, "evidence", "rollouts"),
 		deliverables: join(runDir, "evidence", "deliverables"),
@@ -287,15 +307,22 @@ function harvestDeliverables(sandboxPath: string, touched: readonly string[], de
 	const out: Harvested[] = [];
 	for (const raw of touched.slice(0, MAX_DELIVERABLE_FILES)) {
 		const abs = raw.startsWith("/") ? raw : join(sandboxPath, raw);
-		const rel = toPosix(abs.startsWith(sandboxPath) ? abs.slice(sandboxPath.length).replace(/^\/+/, "") : raw);
-		if (rel.startsWith("..")) continue;
+		// `relPosix` normalizes `.`/`..` and escapes — a plain `startsWith` would
+		// accept a sibling like `/tmp/sb-evil` for sandbox `/tmp/sb`.
+		let rel: string;
+		try {
+			rel = relPosix(sandboxPath, abs);
+		} catch {
+			continue;
+		}
 		let content: string;
 		try {
 			content = readFileSync(abs, "utf8");
 		} catch {
 			continue;
 		}
-		if (content.length > MAX_DELIVERABLE_CHARS) content = `${content.slice(0, MAX_DELIVERABLE_CHARS)}\n…[deliverable capped]`;
+		if (content.length > MAX_DELIVERABLE_CHARS)
+			content = `${content.slice(0, MAX_DELIVERABLE_CHARS)}\n…[deliverable capped]`;
 		writeText(join(destRoot, rel), content);
 		out.push({ rel: `evidence/deliverables/${basename(destRoot)}/${rel}` });
 	}
@@ -305,22 +332,4 @@ function harvestDeliverables(sandboxPath: string, touched: readonly string[], de
 function basename(p: string): string {
 	const parts = p.split(/[\\/]/);
 	return parts[parts.length - 1] || p;
-}
-
-/** Tool usage totals of a session — used by `/rsi-probe` diagnostics. */
-export function probeStats(jsonl: string): string {
-	const summary = summarizeSession(jsonl);
-	const tools = new Map<string, number>();
-	for (const step of summary.steps) tools.set(step.tool, (tools.get(step.tool) ?? 0) + 1);
-	const toolText = [...tools.entries()].map(([t, n]) => `${t}×${n}`).join(" ") || "none";
-	return `turns=${summary.turns} tools=${toolText} usd=${summary.usd.toFixed(4)}`;
-}
-
-/** Recursive `.jsonl` listing helper shared with `/rsi-probe`. */
-export function listSessionFiles(dir: string): string[] {
-	try {
-		return listFiles(dir).filter((f) => f.endsWith(".jsonl"));
-	} catch {
-		return [];
-	}
 }

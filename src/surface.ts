@@ -1,5 +1,5 @@
 /**
- * SurfaceSpec (PLAN-rsi.md §5): the editable harness surface — AGENTS.md,
+ * SurfaceSpec (README “The editable surface”): the editable harness surface — AGENTS.md,
  * `.pi/skills/<name>/{SKILL.md,scripts/**}` and `.pi/prompts/*.md`.
  *
  * Edit contract: *omitted-is-inherited* — a proposal emits only changed files

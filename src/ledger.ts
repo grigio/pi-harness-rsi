@@ -1,5 +1,5 @@
 /**
- * Ledger (PLAN-rsi.md §9): Harness² budget identity `R = 4k` rollouts,
+ * Ledger (README “Safety model”): Harness² budget identity `R = 4k` rollouts,
  * `P = 3k` improvement sessions, USD accounting, fallback counters and the
  * diversity metric — everything `/rsi-status` renders.
  *

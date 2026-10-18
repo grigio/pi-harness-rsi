@@ -1,5 +1,5 @@
 /**
- * Deterministic fake substrate for `PI_RSI_FAKE=1` (PLAN-rsi.md G7).
+ * Deterministic fake substrate for `PI_RSI_FAKE=1`.
  *
  * Two entry points:
  *  - `fakeSessionJsonl()` — synthesizes a child-pi session file for a rollout,

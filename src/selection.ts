@@ -1,5 +1,5 @@
 /**
- * Answer-free selection (PLAN-rsi.md §6.1): anonymized deliverables, seeded
+ * Answer-free selection: anonymized deliverables, seeded
  * shuffle, and the trivial path at k=1 (`trivial_selection` parity — the stage
  * does not exist, so it is never asked for and never billed).
  *

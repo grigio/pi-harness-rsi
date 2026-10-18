@@ -1,5 +1,5 @@
 /**
- * Guardrails (PLAN-rsi.md §10): tripwires, forbidden globs, adoption gate,
+ * Guardrails (README “Safety model”): tripwires, forbidden globs, adoption gate,
  * working-tree hygiene. Everything here is fail-closed and returns verbatim
  * strings — validator messages go straight back to the editor as retry feedback.
  */

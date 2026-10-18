@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 
-/** Character count (Unicode code points). Budgets in PLAN-rsi.md are chars, not UTF-16 units. */
+/** Character count (Unicode code points). Budgets are chars, not UTF-16 units. */
 export function charLen(s: string): number {
 	return [...s].length;
 }

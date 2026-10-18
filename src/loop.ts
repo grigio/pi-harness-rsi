@@ -1,5 +1,5 @@
 /**
- * Loop orchestration (PLAN-rsi.md §6): snapshot → probe → propose → probe →
+ * Loop orchestration: snapshot → probe → propose → probe →
  * compose → probe → select → adopt → reflect, with the budget identity
  * `R = 4k`, `P = 3k` asserted on the ledger.
  *

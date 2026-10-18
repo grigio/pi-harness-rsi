@@ -1,5 +1,5 @@
 /**
- * Editor job runners (PLAN-rsi.md §6.1, §7.3): propose (INV/DOM), compose,
+ * Editor job runners: propose (INV/DOM), compose,
  * select, reflect.
  *
  * The editor is answer-only: it runs with read-only tools in the run directory
@@ -66,7 +66,7 @@ export function replyRules(stage: EditorStage, cfg: RsiConfig): string {
 }
 
 /**
- * Lever prompt from the packaged skill files (PLAN-rsi.md §12). The skills are
+ * Lever prompt from the packaged skill files. The skills are
  * deliberately *not* declared in the package manifest, so pi never advertises
  * them in the user's system prompt — they cost context only inside a mission.
  */

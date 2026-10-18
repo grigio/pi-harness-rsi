@@ -1,5 +1,5 @@
 /**
- * Session JSONL → fixed-shape, capped digest (PLAN-rsi.md §7.2).
+ * Session JSONL → fixed-shape, capped digest (the trajectory artifact of “Context budgets”).
  *
  * Only digests enter missions. Full JSONL and deliverables stay on disk and the
  * mission carries a file map; the editor is told to grep, not to answer from the

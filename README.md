@@ -4,7 +4,10 @@ A **pi extension** for harness self-improvement (RSI, after Harness² / arXiv:26
 with **enforced context economy**: every artifact that may enter an LLM context is
 budgeted by one choke point, and nothing is ever silently truncated.
 
-Design: [PLAN-rsi.md](./PLAN-rsi.md) (budgets, invariants, non-goals).
+Design: budgets, the editable surface, the safety model and a full example
+workflow are documented below — and enforced in code (`src/context.ts`,
+`src/guard.ts`, `src/ledger.ts`) with 49 tests, so every invariant here is
+executable rather than aspirational.
 The loop: `snapshot → probe ×k → propose INV/DOM ×2k → probe ×2k → compose ×k → probe ×k → select → adopt → reflect`.
 
 ## Load it

@@ -1,6 +1,6 @@
 /**
  * pi-harness-rsi — a pi extension for harness self-improvement with enforced
- * context economy (PLAN-rsi.md).
+ * context economy (see README.md).
  *
  * Commands:
  *   /rsi <task>            full loop: probe → propose → probe → compose → probe → select → adopt → reflect

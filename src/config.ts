@@ -1,7 +1,7 @@
 /**
  * Settings schema, budget profiles and environment resolution for rsi.
  *
- * Budgets are profiles, not constants (PLAN-rsi.md §7.1). Every number here is
+ * Budgets are profiles, not constants (README “Context budgets”). Every number here is
  * a hard char cap that `context.assemble()` enforces; `rsi.budgets.*` overrides
  * single keys after profile selection.
  */
@@ -30,9 +30,9 @@ export interface Budgets {
 	/** Reflect mission, fully assembled. */
 	reflectMission: number;
 	/**
-	 * Select mission, fully assembled. Not in the PLAN-rsi table (the table only
-	 * caps per-deliverable excerpts) but `assemble()` needs a declared budget for
-	 * the stage too — see README "deviations".
+	 * Select mission, fully assembled. Not capped by any per-artifact table (the
+	 * table only caps per-deliverable excerpts) but `assemble()` needs a declared
+	 * budget for the stage too — declared here and shown in `/rsi-status`.
 	 */
 	selectMission: number;
 	/** `<notes>` / `<why>` decision notes per stage. */

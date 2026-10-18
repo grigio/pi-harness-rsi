@@ -1,5 +1,5 @@
 /**
- * Harnessing-level library (PLAN-rsi.md §8): per-domain entries holding the
+ * Harnessing-level library: per-domain entries holding the
  * adopted surface snapshot, a validated `EXPERIENCE.md` lesson and a generated
  * `INDEX.md`.
  *

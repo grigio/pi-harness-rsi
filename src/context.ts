@@ -1,5 +1,5 @@
 /**
- * Mission assembly + budget enforcement — the single choke point (PLAN-rsi.md §7.1).
+ * Mission assembly + budget enforcement — the single choke point (README “Context budgets”).
  *
  * Rules:
  *  - every stage declares a char budget from the active profile;

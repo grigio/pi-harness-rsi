@@ -1,5 +1,5 @@
 /**
- * Sandbox lifecycle (PLAN-rsi.md §6.3): one isolated working tree per rollout,
+ * Sandbox lifecycle: one isolated working tree per rollout,
  * matched conditions across arms (only the surface files differ), cleanup in
  * `finally`.
  *

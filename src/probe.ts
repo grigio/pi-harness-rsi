@@ -1,5 +1,5 @@
 /**
- * Child-`pi` runner (PLAN-rsi.md §6.3) and the reference/candidate/composed
+ * Child-`pi` runner and the reference/candidate/composed
  * probes that produce rollouts.
  *
  * Matched conditions: every arm uses the same flags, model, tools and

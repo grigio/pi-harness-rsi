@@ -97,7 +97,7 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
 
 ```bash
 bun install          # dev deps (types only)
-bun test             # 48 tests, includes a full fake loop (PI_RSI_FAKE=1)
+bun test             # 49 tests, includes full fake loops for k=1 and k=2 (PI_RSI_FAKE=1)
 bun run typecheck    # tsc --noEmit, strict
 PI_RSI_FAKE=1 pi --offline -ne -e ./index.ts --print "/rsi --domain demo <task>"   # zero-cost e2e
 ```

@@ -112,6 +112,27 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		expect(readFileSync(join(cwd, "AGENTS.md"), "utf8")).toContain("# Project instructions");
 	}, 60_000);
 
+	test("k=2: selection stage runs — anonymized pool, seeded choice, diversity measured", async () => {
+		const cwd = makeCwd();
+		const report = await run(cwd, fakeCfg({}, { k: 2 }), "fake-k2");
+
+		// R = 4k = 8 (2 refs + 4 candidate probes + 2 finals), P = 3k = 6
+		expect(report.outcome).toBe("adopted");
+		expect(report.identity.ok).toBe(true);
+		expect(report.identity.actual).toEqual({ R: 8, P: 6 });
+
+		const runDir = join(cwd, ".pi", "harness", "runs", "fake-k2");
+		const selection = JSON.parse(readFileSync(join(runDir, "selection.json"), "utf8"));
+		expect(selection.trivial).toBe(false);
+		expect(selection.order.map((o: { id: string }) => o.id)).toEqual(["c0", "c1"]);
+		// labels stay hidden from the judge — the identity map lives only here
+		expect(JSON.stringify(selection)).toContain("final0");
+		expect(typeof loadLedger(runDir)?.diversity).toBe("number"); // mode-collapse signal measured
+		// both composed surfaces exist for audit
+		expect(existsSync(join(runDir, "surfaces", "final0.json"))).toBe(true);
+		expect(existsSync(join(runDir, "surfaces", "final1.json"))).toBe(true);
+	}, 60_000);
+
 	test("USD budget stop fails closed before wasting spend", async () => {
 		const cwd = makeCwd();
 		const cfg = fakeCfg({ PI_RSI_MAX_USD: "0.000001" });

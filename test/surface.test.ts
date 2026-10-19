@@ -81,6 +81,19 @@ describe("path whitelist + guardrails (validate)", () => {
 		expect(report.errors.join("\n")).toContain("tripwire");
 	});
 
+	test("a skill name must be a token, not a substring of ordinary prose", () => {
+		// Regression: `agents.includes(dir)` let a skill called `src` pass because
+		// "source" contains "src", so the required trigger line never existed.
+		const skill = { ...base, ".pi/skills/src/SKILL.md": "---\nname: src\ndescription: d\n---\nbody" };
+		const prose = validate({ ...skill, "AGENTS.md": "# Project\n\nread the source code\n" }, cfg);
+		expect(prose.errors.join("\n")).toContain("not named in AGENTS.md");
+		const named = validate({ ...skill, "AGENTS.md": "# Project\n\n- load `src` for source tasks\n" }, cfg);
+		expect(named.errors.join("\n")).not.toContain("not named in AGENTS.md");
+		// `src` must not be satisfied by a longer, differently-named skill token.
+		const other = validate({ ...skill, "AGENTS.md": "# Project\n\n- load src-notes for tasks\n" }, cfg);
+		expect(other.errors.join("\n")).toContain("not named in AGENTS.md");
+	});
+
 	test("skill dir rules: SKILL.md present, name matches, trigger in AGENTS.md", () => {
 		// a non-SKILL.md file inside .pi/skills is off-surface, so a skill can
 		// never ship a README instead of its SKILL.md
@@ -288,5 +301,32 @@ describe("writeSurface — prune safety, exec bits, review rendering", () => {
 		const b: Surface = { ".pi/prompts/x.md": "# x\n", "AGENTS.md": "# a\n" };
 		expect(sameSurface(a, b)).toBe(true);
 		expect(sameSurface(a, { ...a, "AGENTS.md": "# b\n" })).toBe(false);
+	});
+});
+
+describe("readSurface — scoped walk finds every whitelisted file", () => {
+	test("nested skills, prompts and AGENTS.md are read; everything else is ignored", async () => {
+		const { mkdirSync: mk, mkdtempSync: mkd, writeFileSync: wf } = await import("node:fs");
+		const { tmpdir: td } = await import("node:os");
+		const { join: jn } = await import("node:path");
+		const root = mkd(jn(td(), "rsi-surface-"));
+		mk(jn(root, ".pi", "skills", "foo", "scripts"), { recursive: true });
+		mk(jn(root, ".pi", "prompts"), { recursive: true });
+		mk(jn(root, "src"), { recursive: true });
+		wf(jn(root, "AGENTS.md"), "# project\n");
+		wf(jn(root, ".pi", "skills", "foo", "SKILL.md"), "---\nname: foo\ndescription: d\n---\nbody\n");
+		wf(jn(root, ".pi", "skills", "foo", "scripts", "run.sh"), "#!/bin/sh\n");
+		wf(jn(root, ".pi", "skills", "foo", "README.md"), "off-surface\n");
+		wf(jn(root, ".pi", "prompts", "p.md"), "prompt\n");
+		wf(jn(root, "src", "index.ts"), "export {}\n");
+		wf(jn(root, "package.json"), "{}\n");
+
+		const surface = readSurface(root, cfg);
+		expect(Object.keys(surface).sort()).toEqual([
+			".pi/prompts/p.md",
+			".pi/skills/foo/SKILL.md",
+			".pi/skills/foo/scripts/run.sh",
+			"AGENTS.md",
+		]);
 	});
 });

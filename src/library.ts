@@ -380,9 +380,9 @@ export type RevertResolution = { ok: true; target: RevertTarget } | { ok: false;
 
 /**
  * Resolve *which* library entry `/rsi revert` means, without touching the live
- * tree. Split out from `revertSurface` so the command layer can apply the
- * snapshot inside the same guarded transaction as adoption (dirty check, run
- * lock, rollback) instead of writing straight to the tree.
+ * tree. Split out so the command layer can apply the snapshot inside the same
+ * guarded transaction as adoption (dirty check, run lock, rollback) instead of
+ * writing straight to the tree.
  *
  * With no slug, the most recently adopted entry in `domain` (or the whole
  * library when `domain` is omitted) is used. An explicit target must resolve or
@@ -432,32 +432,6 @@ export function resolveRevertTarget(
 		};
 	}
 	return { ok: false, message: "no previous surface snapshot found in the library" };
-}
-
-/**
- * Restore a previously adopted surface into the live tree.
- *
- * Low-level primitive (no dirty-tree check, no lock): the `/rsi revert`
- * command must go through the guarded transaction in `loop.revertAdopted`, which
- * uses `resolveRevertTarget` directly. Kept for tests and for callers that
- * already hold those guards.
- */
-export function revertSurface(
-	repoRoot: string,
-	cfg: Pick<RsiConfig, "libraryDir">,
-	opts: { domain?: string; slug?: string },
-): RevertResult {
-	const resolved = resolveRevertTarget(repoRoot, cfg, opts);
-	if (!resolved.ok) return { ok: false, restored: "", message: resolved.message };
-	const { domain, slug, snapshot } = resolved.target;
-	writeSurface(repoRoot, snapshot, { prune: true });
-	return {
-		ok: true,
-		domain,
-		slug,
-		restored: Object.keys(snapshot).sort().join(", "),
-		message: `restored previous surface for ${domain}/${slug}`,
-	};
 }
 
 /** Write the loop's EXPERIENCE.md only when validation passes (else write nothing). */

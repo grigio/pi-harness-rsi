@@ -9,7 +9,7 @@
  * so they are written as instructions, not as stack traces.
  */
 
-import { chmodSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { forbiddenError, forbiddenMatch, scanScriptBody, scanTripwire, scriptScanError, tripwireError } from "./guard";
@@ -73,8 +73,6 @@ const RE_SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const MAX_FILES_PER_SKILL = 20;
 const MAX_PROMPT_FILES = 20;
 
-export const SURFACE_DIRS = [".pi/skills", ".pi/prompts"] as const;
-
 /**
  * Path whitelist. Returns a verbatim error string when the path may not be
  * edited, otherwise undefined.
@@ -112,24 +110,27 @@ export function skillDirOf(path: string): string | undefined {
 	return m?.[1];
 }
 
+/**
+ * Directories that can ever hold a surface file (`isAllowedPath` only accepts
+ * these shapes). Walking the whole project to find them is wasted work, and on a
+ * tree large enough to hit `listFiles`' file cap it could silently *miss* a
+ * surface file depending on traversal order — so the walk is scoped here.
+ */
+const SURFACE_ROOTS = [".pi/skills", ".pi/prompts"] as const;
+
 /** Read the surface out of a working tree (live tree or sandbox). */
 export function readSurface(root: string, cfg?: Pick<RsiConfig, "forbiddenGlobs">): Surface {
 	const surface: Surface = {};
 	const agents = join(root, "AGENTS.md");
 	if (exists(agents)) surface["AGENTS.md"] = readTextIf(agents) ?? "";
 
-	const candidates = listFiles(root, {
-		excludeDirs: [".git", "node_modules", ".pi/harness", "dist", "build", ".cache"],
-	});
-	for (const rel of candidates) {
-		if (rel === "AGENTS.md") continue;
-		if (isAllowedPath(rel) !== undefined) continue;
-		if (cfg && forbiddenMatch(rel, cfg) !== undefined) continue;
-		const abs = join(root, rel);
-		try {
-			surface[rel] = readFileSync(abs, "utf8");
-		} catch {
-			// unreadable file — ignored, validate() reports a missing AGENTS.md if it matters
+	for (const rootDir of SURFACE_ROOTS) {
+		if (!exists(join(root, rootDir))) continue;
+		for (const rel of listFiles(join(root, rootDir))) {
+			const path = `${rootDir}/${rel}`;
+			if (isAllowedPath(path) !== undefined) continue;
+			if (cfg && forbiddenMatch(path, cfg) !== undefined) continue;
+			surface[path] = readTextIf(join(root, path)) ?? "";
 		}
 	}
 	return surface;
@@ -289,6 +290,18 @@ export function validate(
 	};
 }
 
+/**
+ * Whether the always-on file *names* a skill. A plain `includes` was too weak:
+ * a skill directory called `src` or `test` matched ordinary prose (`source`,
+ * `latest`), so the required trigger line never had to exist. A name only counts
+ * at a token boundary — `` `src` ``, `src skill`, `.pi/skills/src/SKILL.md` —
+ * and the boundary excludes hyphens so `src` does not match `src-notes`.
+ */
+export function mentionsSkill(agents: string, dir: string): boolean {
+	const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`(^|[^\\w-])${escaped}([^\\w-]|$)`, "i").test(agents);
+}
+
 function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): { errors: Issue[]; warnings: Issue[] } {
 	const errors: Issue[] = [];
 	const warnings: Issue[] = [];
@@ -374,7 +387,7 @@ function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): {
 		}
 
 		// Every skill must be named in the always-on file, or it is dead weight.
-		if (typeof agents === "string" && !agents.includes(dir)) {
+		if (typeof agents === "string" && !mentionsSkill(agents, dir)) {
 			err(
 				`skill-unnamed:${dir}`,
 				`${where}skill "${dir}" is not named in AGENTS.md — add a trigger line mentioning "${dir}" so the always-on context can route to it`,

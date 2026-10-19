@@ -168,3 +168,28 @@ describe("util.mapLimit — fail fast and quiet", () => {
 		expect(peakRunning).toBeLessThanOrEqual(2);
 	});
 });
+
+describe("util.writeTextAtomic — a failed write leaves the old file intact", () => {
+	test("an unreadable directory makes the write fail without truncating the file", async () => {
+		const { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { writeTextAtomic } = await import("../src/util");
+
+		const dir = mkdtempSync(join(tmpdir(), "rsi-atomic-"));
+		const file = join(dir, "ledger.json");
+		writeFileSync(file, '{"old":true}\n');
+		chmodSync(dir, 0o555); // no new/tmp files may be created here
+		try {
+			expect(() => writeTextAtomic(file, '{"new":true}\n')).toThrow();
+		} finally {
+			chmodSync(dir, 0o755);
+		}
+		// The reader sees either the old content or the new one — never a truncated file.
+		expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ old: true });
+		// And no temporary sibling is left behind on the success path.
+		writeTextAtomic(file, '{"new":true}\n');
+		expect(readdirSync(dir)).toEqual(["ledger.json"]);
+		expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ new: true });
+	});
+});

@@ -92,6 +92,7 @@ import {
 	segmentError,
 	slugify,
 	writeText,
+	writeTextAtomic,
 } from "./util";
 import { type ActiveRun, beginRun, endRun, pushLiveNote, type RunKind, runIsLive, STOP_FILE, setStage } from "./watch";
 import { cleanupSandboxes, ensureHarnessIgnored, prepareSandbox, type Sandbox, sandboxId } from "./worktree";
@@ -449,6 +450,7 @@ async function runEditorStage(
 ): Promise<ProposedCandidate> {
 	const { cfg, runDir } = ctx;
 	const { label } = args;
+	const startedAt = Date.now();
 	let lastError = "";
 	let spentUsd = 0;
 	let attempts = 0;
@@ -525,7 +527,15 @@ async function runEditorStage(
 	ctx.ledger.counters.keptBase++;
 	ctx.ledger.counters.fellBack++;
 	const failure = lastError || `${args.budgetStage} produced no valid delta`;
-	addEntry(ctx.ledger, { kind: "session", label: args.ledgerLabel, usd: spentUsd, attempts, wallMs: attempts * 1 });
+	// Real elapsed time, not a fabricated `attempts * 1`: the ledger's wall time
+	// is reported next to the USD budget and must not be invented.
+	addEntry(ctx.ledger, {
+		kind: "session",
+		label: args.ledgerLabel,
+		usd: spentUsd,
+		attempts,
+		wallMs: Date.now() - startedAt,
+	});
 	note(ctx, `${label}: fell back to the current surface — ${failure.slice(0, 200)}`, "warn");
 	return { ok: false, surface: args.base, delta: { files: [] }, notes: failure, usd: 0, failure };
 }
@@ -891,6 +901,17 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 			return finish(ctx, { outcome: "error", chosen: chosenLabel, errors: true });
 		}
 
+		// --- identity guard -------------------------------------------------
+		// `R = 4k, P = 3k` is the loop's accounting contract, and it is a
+		// *precondition* for trusting the candidate: a ledger that lost or
+		// double-counted a stage cannot attribute the deliverable to this surface.
+		// Checked before the tree is touched, not merely reported after adoption.
+		const identityBlock = identityBlockForAdoption(ctx.ledger);
+		if (identityBlock) {
+			note(ctx, `identity mismatch before adoption: ${identityBlock} — nothing adopted`, "error");
+			return finish(ctx, { outcome: "error", chosen: chosenLabel, errors: true });
+		}
+
 		// --- adopt (human gate) ---------------------------------------------
 		setStage(ctx.watch, "adopt gate");
 		const gate = await resolveAdoptionGate(ctx, chosenLabel, chosenEntry.candidate.surface, base, opts);
@@ -1188,6 +1209,19 @@ interface FinishOptions {
 }
 
 function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
+	// The run is over the moment `finish` is entered, even if a write below throws
+	// (disk full, a removed run dir): the lock and the live registry are released
+	// in `finally`, otherwise one failed status write wedges the project for the
+	// whole 12 h stale-lock window.
+	try {
+		return finishRun(ctx, opts);
+	} finally {
+		endRun(ctx.watch.runId);
+		ctx.releaseLock();
+	}
+}
+
+function finishRun(ctx: RunContext, opts: FinishOptions): LoopReport {
 	ctx.clearDeadline?.();
 	ctx.ledger.outcome = opts.outcome;
 	ctx.ledger.endedAt = new Date().toISOString();
@@ -1209,8 +1243,8 @@ function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 		note(ctx, `identity mismatch: ${identity.problems.join("; ")}`, "error");
 	}
 	const status = renderStatus({ ledger: ctx.ledger, cfg: ctx.cfg });
-	writeText(join(ctx.runDir, "status.txt"), `${status}\n`);
-	writeText(
+	writeTextAtomic(join(ctx.runDir, "status.txt"), `${status}\n`);
+	writeTextAtomic(
 		join(ctx.runDir, "report.json"),
 		JSON.stringify(
 			{
@@ -1233,8 +1267,6 @@ function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 		),
 	);
 
-	endRun(ctx.watch.runId);
-	ctx.releaseLock();
 	return {
 		runId: ctx.runId,
 		runDir: ctx.runDir,
@@ -1278,14 +1310,32 @@ export function latestRunDir(cwd: string): string | undefined {
 
 export function runDirFor(cwd: string, runId?: string): string | undefined {
 	if (runId) {
+		// A run id becomes a path segment. `adopt` already rejects traversal ids;
+		// `status <runId>` must too, or it reads `<any dir>/ledger.json` on disk.
+		if (segmentError(runId, "run id")) return undefined;
 		const dir = join(cwd, ".pi", "harness", "runs", runId);
 		return loadLedger(dir) ? dir : undefined;
 	}
 	return latestRunDir(cwd);
 }
 
+/**
+ * The identity failure that must block adoption, or undefined when the ledger
+ * accounts for exactly `R = 4k` rollouts and `P = 3k` sessions.
+ *
+ * Adoption writes the live tree, so this is a guard, not a diagnostic: a
+ * mismatch means a stage was lost or double-counted and the composed surface
+ * cannot be attributed to the run that supposedly produced it.
+ */
+export function identityBlockForAdoption(ledger: LedgerFile): string | undefined {
+	const identity = assertIdentity(ledger);
+	return identity.ok ? undefined : identity.problems.join("; ");
+}
+
 /** `/rsi status [runId]` — pure render of the persisted ledger. */
 export function statusOfRun(opts: Pick<CommandOptions, "cwd" | "cfg" | "runId">): { ok: boolean; text: string } {
+	const idError = opts.runId ? segmentError(opts.runId, "run id") : undefined;
+	if (idError) return { ok: false, text: `invalid run id: ${idError}` };
 	const runDir = runDirFor(opts.cwd, opts.runId);
 	if (!runDir)
 		return { ok: false, text: "no rsi runs yet — /rsi probe <task> for evidence, /rsi start <task> for the full loop" };

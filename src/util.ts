@@ -13,6 +13,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -55,6 +56,25 @@ export function ensureDir(dir: string): void {
 export function writeText(path: string, content: string): void {
 	ensureDir(dirname(path));
 	writeFileSync(path, content, "utf8");
+}
+
+/**
+ * Write a file through a temporary sibling + `rename`, so a reader (or a crash)
+ * never observes a half-written file. Used for the run ledger, status and report:
+ * a truncated `ledger.json` makes the run unreadable, and retention is documented
+ * to keep what it cannot account for.
+ */
+export function writeTextAtomic(path: string, content: string): void {
+	ensureDir(dirname(path));
+	const tmp = `${path}.${process.pid}.tmp`;
+	writeFileSync(tmp, content, "utf8");
+	try {
+		renameSync(tmp, path);
+	} catch {
+		// Windows cannot rename over an existing file: replace it explicitly.
+		rmSync(path, { force: true });
+		renameSync(tmp, path);
+	}
 }
 
 export function readText(path: string): string {

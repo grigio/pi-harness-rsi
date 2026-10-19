@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { resolveConfig } from "../src/config";
 import { addEntry, assertIdentity, countRP, loadLedger, newLedger } from "../src/ledger";
 import { heldRunLock, lockPath } from "../src/lock";
-import { type LoopReport, runLoop, runReferenceProbes, statusOfRun } from "../src/loop";
+import { identityBlockForAdoption, type LoopReport, runLoop, runReferenceProbes, statusOfRun } from "../src/loop";
+import { getActiveRun } from "../src/watch";
 
 function makeCwd(): string {
 	const dir = mkdtempSync(join(tmpdir(), "rsi-loop-"));
@@ -83,6 +84,46 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		expect(status.text).toContain("identity OK");
 		expect(status.text).toContain("outcome: adopted");
 	}, 60_000);
+
+	test("a failed status write still releases the run lock and the live registry", async () => {
+		// Regression: `finish` wrote status/report before releasing the lock, with
+		// no finally. One failed write leaked the lock, wedging the project until
+		// the 12 h stale window and leaving `/rsi stop` pointing at a dead run.
+		const cwd = makeCwd();
+		const runDir = join(cwd, ".pi", "harness", "runs", "write-fails");
+		mkdirSync(join(runDir, "status.txt"), { recursive: true }); // a directory, not a file
+		let threw = false;
+		try {
+			await run(cwd, fakeCfg(), "write-fails");
+		} catch {
+			threw = true;
+		}
+		expect(threw).toBe(true);
+		expect(heldRunLock(cwd)).toBeUndefined();
+		expect(getActiveRun()).toBeUndefined();
+	}, 60_000);
+
+	test("the R=4k/P=3k identity blocks adoption before the tree is touched", () => {
+		// The identity used to be reported only *after* adoption. It is a guard:
+		// a ledger missing a session cannot attribute the candidate to this run.
+		const ledger = newLedger("id-1", "task", "demo", fakeCfg());
+		for (let i = 0; i < 4; i++) addEntry(ledger, { kind: "rollout", label: `ref${i}`, usd: 0, attempts: 1 });
+		for (let i = 0; i < 3; i++) addEntry(ledger, { kind: "session", label: `s${i}`, usd: 0, attempts: 1 });
+		expect(identityBlockForAdoption(ledger)).toBeUndefined();
+		ledger.entries.pop(); // lose one improvement session
+		expect(identityBlockForAdoption(ledger)).toContain("P=");
+		// A completed fake run therefore adopts only with an intact identity.
+	});
+
+	test("/rsi status on a traversal run id is rejected, not read from disk", () => {
+		// Regression: `runDirFor` joined any run id into the runs path, so
+		// `/rsi status ../../..` read `<any dir>/ledger.json`. `adopt` already
+		// validated its ids; `status` must use the same rule.
+		const cwd = makeCwd();
+		const status = statusOfRun({ cwd, runId: "../..", cfg: fakeCfg() });
+		expect(status.ok).toBe(false);
+		expect(status.text).toContain("invalid run id");
+	});
 
 	test("invalid-first: the retry carries the verbatim validator error, identity holds", async () => {
 		const cwd = makeCwd();

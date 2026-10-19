@@ -398,6 +398,10 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_MAX_MINUTES`, `PI_RSI_PI_BIN`
   restore can no longer clobber uncommitted work or race an adoption.
 - **Fail closed**: invalid editor output → one retry carrying the verbatim
   validator error → fallback to the current surface (counted in the ledger).
+- **Identity before adoption**: `R = 4k, P = 3k` is a precondition, not a
+  post-hoc report — a ledger that lost or double-counted a stage closes the run
+  as `error` *before* the adoption gate, so the live tree is never written for a
+  candidate that cannot be attributed to the run.
 - **Fail open** only at selection (judge unavailable → pick `c0`, recorded),
   because refusing selection cannot corrupt a grader.
 - **Interruption**: `/rsi stop` interrupts the run before its normal end. In

@@ -12,7 +12,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { formatMinutes } from "./config";
-import { ensureDir, exists, readTextIf, writeText } from "./util";
+import { ensureDir, exists, readTextIf, writeTextAtomic } from "./util";
 
 export type LedgerKind = "rollout" | "session" | "selection" | "reflection";
 
@@ -126,7 +126,8 @@ export function loadLedger(runDir: string): LedgerFile | undefined {
 export function saveLedger(runDir: string, ledger: LedgerFile): void {
 	ledger.updatedAt = new Date().toISOString();
 	ensureDir(runDir);
-	writeText(ledgerPath(runDir), JSON.stringify(ledger, null, "\t"));
+	// Atomic: a crash mid-write must not leave an unreadable ledger behind.
+	writeTextAtomic(ledgerPath(runDir), JSON.stringify(ledger, null, "\t"));
 }
 
 export function addEntry(ledger: LedgerFile, entry: Omit<LedgerEntry, "ts">): void {

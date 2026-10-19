@@ -187,3 +187,63 @@ describe("editor.sessionFailure — a provider error is not an unparsable reply"
 		expect(sessionFailure("")).toBeUndefined();
 	});
 });
+
+describe("editor.runEditor — a rerun must not inherit the previous session", () => {
+	// Regression: `runProbe` clears its session dir before spawning, `runEditor`
+	// did not. Re-adopting a pending run reuses `sessions/editor-reflect-0`, so a
+	// child that died before writing a session file was answered with the previous
+	// session's reply — a stale lesson written as if it were freshly generated.
+	const STUB = `#!/bin/sh
+dir=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--session-dir" ]; then dir="$a"; fi
+  prev="$a"
+done
+mkdir -p "$dir"
+count=0
+if [ -f .stub-count ]; then count=$(cat .stub-count); fi
+count=$((count + 1))
+printf '%s' "$count" > .stub-count
+if [ "$count" -eq 1 ]; then
+  printf '%s\\n' '{"type":"message","message":{"role":"assistant","content":"first reply"}}' > "$dir/sess.jsonl"
+fi
+exit 0
+`;
+
+	test("a child that writes no session file yields no reply, not the old one", async () => {
+		const { chmodSync, mkdirSync, mkdtempSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runEditor } = await import("../src/editor");
+
+		const dir = mkdtempSync(join(tmpdir(), "rsi-editor-"));
+		const runDir = join(dir, "run");
+		mkdirSync(runDir, { recursive: true });
+		const bin = join(dir, "pi-stub");
+		writeFileSync(bin, STUB);
+		chmodSync(bin, 0o755);
+		const previous = process.env.PI_RSI_PI_BIN;
+		process.env.PI_RSI_PI_BIN = bin;
+		try {
+			const cfgNoFake = resolveConfig({ profile: "small", stageTimeoutMs: 3_000 }, {} as NodeJS.ProcessEnv);
+			const mission = { stage: "reflect" as const, text: "mission", used: 7, budget: 100, dropped: [] };
+			const opts = {
+				stage: "reflect" as const,
+				mission,
+				missionPath: join(runDir, "missions", "reflect.md"),
+				runDir,
+				cfg: cfgNoFake,
+				attempt: 0,
+				fake: { stage: "reflect" as const, domain: "demo", skillName: "demo-notes", baseAgents: "" },
+			};
+			const first = await runEditor(opts);
+			expect(first.reply).toBe("first reply");
+			const second = await runEditor(opts);
+			expect(second.reply).toBe("");
+		} finally {
+			if (previous === undefined) delete process.env.PI_RSI_PI_BIN;
+			else process.env.PI_RSI_PI_BIN = previous;
+		}
+	}, 20_000);
+});

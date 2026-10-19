@@ -19,7 +19,7 @@ import { type FakeEditorContext, type FakeStage, fakeEditorReply } from "./fake"
 import { buildChildArgs, findSessionFile, spawnPi } from "./probe";
 import { renderFileMap, type Surface, type SurfaceDelta, type SurfaceDiff, summarizeDiff } from "./surface";
 import { sessionUsd } from "./trajectory";
-import { extractTag, readTextIf, stripFence, writeText } from "./util";
+import { extractTag, readTextIf, rmrf, stripFence, writeText } from "./util";
 
 export type EditorStage = "propose-inv" | "propose-dom" | "compose" | "select" | "reflect";
 
@@ -433,6 +433,11 @@ export async function runEditor(opts: RunEditorOptions): Promise<EditorRun> {
 	}
 
 	const sessionDir = join(runDir, "sessions", `editor-${opts.stage}-${opts.attempt}`);
+	// Clear the session dir first, exactly like a rollout probe: re-adopting a
+	// pending run reuses `editor-reflect-0`, and a child that dies before writing
+	// a session file would otherwise be answered with the *previous* session's
+	// reply (a stale lesson written as if it were fresh, plus stale cost).
+	rmrf(sessionDir);
 	const args = buildChildArgs({
 		sessionDir,
 		prompt: mission.text,

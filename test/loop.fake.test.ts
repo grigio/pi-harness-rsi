@@ -190,6 +190,23 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		).rejects.toThrow(/in flight/);
 	});
 
+	test("a project without AGENTS.md adopts without the harness dirtying the tree", async () => {
+		const cwd = makeCwd(); // README only, no AGENTS.md, clean tree
+		expect(existsSync(join(cwd, "AGENTS.md"))).toBe(false);
+		// No `force`: the initial and the adoption-gate clean checks both run.
+		const report = await runLoop({
+			cfg: fakeCfg(),
+			cwd,
+			task: "keep the checks green while editing",
+			domain: "demo",
+			runId: "no-agents-starter",
+			io: { log: () => {}, confirmAdoption: async () => true },
+		});
+		expect(report.outcome).toBe("adopted");
+		// Adoption is what creates the always-on file, not the start of the run.
+		expect(existsSync(join(cwd, "AGENTS.md"))).toBe(true);
+	});
+
 	test("continuity pre-flight refuses a greenfield task on an existing project", async () => {
 		const cwd = makeCwd();
 		writeFileSync(

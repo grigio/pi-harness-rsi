@@ -734,14 +734,12 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		// --- snapshot(base) -------------------------------------------------
 		const base = readSurface(opts.cwd, cfg);
 		if (base["AGENTS.md"] === undefined) {
-			// The always-on file is real project state, not run scratch: rather than
-			// carrying a synthesized file only inside the run, materialize a starter
-			// AGENTS.md in the tree so adoption — and the user's own edits — start
-			// from a file that actually exists. (Reference-only `/rsi probe` keeps
-			// its synthesis in memory: that verb promises zero edits.)
+			// Synthesize the always-on file *in memory only*. Writing it to the live
+			// tree here used to dirty the working tree, so the adoption gate (same
+			// tree, `requireClean`) refused every run on a project that had no
+			// AGENTS.md yet. Adoption writes the file as part of the chosen surface.
 			base["AGENTS.md"] = "# Project instructions\n";
-			writeText(join(opts.cwd, "AGENTS.md"), base["AGENTS.md"]);
-			note(ctx, "no AGENTS.md in the working tree — created a starter always-on file (AGENTS.md in the project root)");
+			note(ctx, "no AGENTS.md in the working tree — adoption will create it from the chosen surface");
 		}
 		writeText(join(ctx.runDir, "base", "surface.json"), surfaceToJson(base));
 		const baseReport = validate(base, cfg, { where: "base" });

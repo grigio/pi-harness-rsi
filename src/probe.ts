@@ -10,13 +10,12 @@
  * session so the whole loop runs with zero model calls.
  */
 
-import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { captureIdentity, type ProjectIdentity, subjectDrift } from "./continuity";
 import { fakeSessionJsonl } from "./fake";
-import { capture, killTree } from "./proc";
+import { runProcess } from "./proc";
 import { digest, sessionUsd, writtenPaths } from "./trajectory";
 import { ensureDir, readTextIf, relPosix, rmrf, toPosix, writeText } from "./util";
 import { runVerifier, type Sandbox } from "./worktree";
@@ -72,63 +71,35 @@ export function buildChildArgs(opts: {
 	return args;
 }
 
-export function spawnPi(
+/**
+ * Run a child `pi` under the stage timeout and the run's abort signal.
+ *
+ * Delegates to `proc.runProcess` so the child is killed as a process *tree*
+ * with the same SIGTERM→SIGKILL escalation as the verifier. A local spawn loop
+ * used to send only SIGTERM on `/rsi stop`, so a child that trapped SIGTERM kept
+ * the run alive until the stage timeout — the "stop does nothing" report.
+ */
+export async function spawnPi(
 	args: string[],
-	opts: { cwd: string; cfg: RsiConfig; signal?: AbortSignal },
+	opts: { cwd: string; cfg: RsiConfig; signal?: AbortSignal; killGraceMs?: number },
 ): Promise<ChildRun> {
 	const bin = process.env.PI_RSI_PI_BIN ?? "pi";
-	const started = Date.now();
-	return new Promise((resolve) => {
-		let stdout = "";
-		let stderr = "";
-		let killed = false;
-		let settled = false;
-
-		const child = spawn(bin, args, {
-			cwd: opts.cwd,
-			env: childEnv(opts.cfg),
-			stdio: ["ignore", "pipe", "pipe"],
-			detached: process.platform !== "win32",
-		});
-
-		let killTimer: ReturnType<typeof setTimeout> | undefined;
-		const timer = setTimeout(() => {
-			killed = true;
-			killTree(child, "SIGTERM");
-			// Escalate if the group ignores SIGTERM.
-			killTimer = setTimeout(() => killTree(child, "SIGKILL"), 5_000);
-		}, opts.cfg.stageTimeoutMs);
-
-		const onAbort = (): void => {
-			killed = true;
-			killTree(child, "SIGTERM");
-		};
-		// The signal may already be aborted by the time we spawn (stop during
-		// sandbox setup): an `addEventListener` after the fact never fires.
-		if (opts.signal?.aborted) onAbort();
-		else opts.signal?.addEventListener("abort", onAbort, { once: true });
-
-		child.stdout.setEncoding("utf8");
-		child.stderr.setEncoding("utf8");
-		child.stdout.on("data", (chunk: string) => {
-			stdout = capture(stdout, chunk);
-		});
-		child.stderr.on("data", (chunk: string) => {
-			stderr = capture(stderr, chunk);
-		});
-
-		const finish = (code: number, error?: string): void => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			if (killTimer) clearTimeout(killTimer);
-			opts.signal?.removeEventListener("abort", onAbort);
-			resolve({ code, stdout, stderr, wallMs: Date.now() - started, killed, error });
-		};
-
-		child.on("error", (err) => finish(127, err.message));
-		child.on("close", (code) => finish(code ?? (killed ? 124 : 1), killed ? "timed out or aborted" : undefined));
+	const result = await runProcess(bin, args, {
+		cwd: opts.cwd,
+		env: childEnv(opts.cfg),
+		timeoutMs: opts.cfg.stageTimeoutMs,
+		signal: opts.signal,
+		killGraceMs: opts.killGraceMs,
 	});
+	const killedError = result.timedOut ? "timed out" : result.killed ? "aborted" : undefined;
+	return {
+		code: result.code,
+		stdout: result.stdout,
+		stderr: result.stderr,
+		wallMs: result.wallMs,
+		killed: result.killed,
+		error: result.error ?? killedError,
+	};
 }
 
 /** Newest `.jsonl` under a session dir (pi names files `<timestamp>_<id>.jsonl`). */

@@ -45,6 +45,18 @@ describe("/rsi argument parsing (src/args.ts)", () => {
 		expect(adopt.positional).toEqual(["final0"]);
 	});
 
+	test("--replace is an explicit opt-out of the continuity guard", () => {
+		const start = parseCommand("start --replace build a different demo");
+		expect(flagBool(start, "replace")).toBe(true);
+		expect(start.text).toBe("build a different demo");
+
+		const probe = parseCommand("probe --replace build a different demo");
+		expect(flagBool(probe, "replace")).toBe(true);
+
+		// Default is continuation: no flag, no replacement authority.
+		expect(flagBool(parseCommand("start improve the heart demo"), "replace")).toBe(false);
+	});
+
 	test("--flag=value form", () => {
 		const cmd = parseCommand("start --k=2 --domain=acme do the thing");
 		expect(flagString(cmd, "k")).toBe("2");

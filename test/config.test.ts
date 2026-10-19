@@ -38,14 +38,18 @@ describe("resolveConfig — money and counts that must not silently floor to zer
 });
 
 describe("resolveConfig — wall-clock budget (free models make USD meaningless)", () => {
-	test("the default is 5 minutes", () => {
-		expect(resolveConfig({}, env).maxRunMs).toBe(5 * 60_000);
+	test("the default comfortably exceeds one stage timeout", () => {
+		// A real k=1 run is 3 rollouts + 3 editor sessions (7-20 min on a free
+		// model) and one stage may legally take 10 min; a 5 min cap aborted every
+		// run before it could finish.
+		expect(resolveConfig({}, env).maxRunMs).toBe(30 * 60_000);
+		expect(resolveConfig({}, env).maxRunMs).toBeGreaterThan(resolveConfig({}, env).stageTimeoutMs);
 	});
 
 	test("maxRunMinutes is honoured, with a floor against an unusable setting", () => {
 		expect(resolveConfig({ maxRunMinutes: 20 }, env).maxRunMs).toBe(20 * 60_000);
 		expect(resolveConfig({ maxRunMinutes: 1.5 }, env).maxRunMs).toBe(90_000);
-		expect(resolveConfig({ maxRunMinutes: 0 }, env).maxRunMs).toBe(5 * 60_000);
+		expect(resolveConfig({ maxRunMinutes: 0 }, env).maxRunMs).toBe(30 * 60_000);
 		expect(resolveConfig({ maxRunMinutes: 0.01 }, env).maxRunMs).toBe(60_000); // below MIN_MAX_RUN_MS
 	});
 

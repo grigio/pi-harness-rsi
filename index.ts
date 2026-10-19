@@ -15,6 +15,12 @@
  *   /rsi library [domain]       browse domains, entries and INDEX.md
  *   /rsi help                   the verb table
  *
+ * A run continues the project already on disk. The baseline identity is
+ * captured before probing; a deliverable that replaces the project's subject
+ * (or deletes the artifact that named it) fails the run before adoption.
+ * `--replace` is the explicit opt-out for tasks that really do want a new
+ * subject.
+ *
  * A line that does not start with a verb is a `start` task, so
  * `/rsi fix the flaky test` works. Flags must precede the task
  * (`/rsi start --k 2 fix the flaky test`); see src/args.ts.
@@ -382,13 +388,14 @@ async function runStart(cfg: RsiConfig, cmd: ParsedCommand, ctx: ExtensionComman
 	}
 	const domain = flagString(cmd, "domain") ?? inferDomain(task, ctx.cwd);
 	const force = flagBool(cmd, "force");
+	const replace = flagBool(cmd, "replace");
 	if (flagBool(cmd, "yes")) cfg.confirmAdopt = false;
 
 	if (refuseWhenBusy(ctx, "start")) return;
 
 	say(ctx, `rsi: ${describeConfig(cfg)} — task "${truncateMiddle(task, 80)}"`, "info");
 	const spinner = startFooterSpinner(ctx, `run: ${task}`);
-	const report = await runLoop({ cfg, cwd: ctx.cwd, task, domain, force, io: makeIO(ctx, spinner) });
+	const report = await runLoop({ cfg, cwd: ctx.cwd, task, domain, force, replace, io: makeIO(ctx, spinner) });
 	const hint = nextStep(ctx.cwd);
 	spinner.stop(barText(`run ${report.runId}: ${report.outcome}${report.chosen ? ` (${report.chosen})` : ""}`, hint));
 	echo(ctx, report.status);
@@ -417,6 +424,7 @@ async function runProbe(cfg: RsiConfig, cmd: ParsedCommand, ctx: ExtensionComman
 		domain: flagString(cmd, "domain") ?? inferDomain(task, ctx.cwd),
 		io: makeIO(ctx, spinner),
 		force: true,
+		replace: flagBool(cmd, "replace"),
 	});
 	say(ctx, `rsi-probe ${report.runId}: ${report.outcome} · digests in ${report.runDir}/digests`, "info");
 	echo(ctx, report.status);

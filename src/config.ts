@@ -155,8 +155,14 @@ const POSITIVE_FLOAT = (n: unknown, fallback: number, min: number): number =>
 
 /** Smallest budget worth honouring: a run that cannot spend a cent is a misconfiguration. */
 export const MIN_USD = 0.01;
-/** Default wall-clock cap: 5 minutes, independent of USD (free models still take time). */
-export const DEFAULT_MAX_RUN_MS = 5 * 60_000;
+/** Default wall-clock cap: 30 minutes, independent of USD (free models still take time).
+ *
+ * The cap must be larger than a single stage timeout (10 min by default): with
+ * `k=1` a real run is three rollouts plus three editor sessions and routinely
+ * takes 7–20 minutes on a free model, so a smaller cap aborts every run before
+ * the propose stage can finish.
+ */
+export const DEFAULT_MAX_RUN_MS = 30 * 60_000;
 /** Below a minute a real run cannot even finish one probe; reject the misconfiguration. */
 export const MIN_MAX_RUN_MS = 60_000;
 /** A profile override of 0 chars would make every stage fail; 1 char is honoured. */

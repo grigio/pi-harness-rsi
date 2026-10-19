@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
+import { captureIdentity, type ProjectIdentity, subjectDrift } from "./continuity";
 import { fakeSessionJsonl } from "./fake";
 import { capture, killTree } from "./proc";
 import { digest, sessionUsd, writtenPaths } from "./trajectory";
@@ -168,6 +169,10 @@ export interface ProbeRequest {
 	prompt: string;
 	runDir: string;
 	cfg: RsiConfig;
+	/** Project identity captured before the run; used to detect subject replacement. */
+	identity?: ProjectIdentity;
+	/** Explicit opt-out of the continuity guard (`--replace`). */
+	replace?: boolean;
 	signal?: AbortSignal;
 }
 
@@ -184,6 +189,8 @@ export interface ProbeResult {
 	deliverables: string[];
 	diffStat?: string;
 	verifier?: string;
+	/** Set when the deliverable replaced the project's subject (continuity guard). */
+	drift?: string;
 	error?: string;
 }
 
@@ -261,6 +268,9 @@ export async function runProbe(req: ProbeRequest): Promise<ProbeResult> {
 	const diffStat = await sandbox.diffStat();
 
 	const relPointer = toPosix(join("evidence", "rollouts", `${label}.jsonl`));
+	// Continuity is judged against the sandbox *after* the solver ran: the run's
+	// baseline identity comes from the live tree, the deliverable's from this tree.
+	const drift = req.identity && !req.replace ? subjectDrift(req.identity, captureIdentity(sandbox.path)) : undefined;
 	const digestResult = digest({
 		label,
 		sessionJsonl: jsonl,
@@ -272,7 +282,8 @@ export async function runProbe(req: ProbeRequest): Promise<ProbeResult> {
 		pointer: relPointer,
 	});
 	ensureDir(paths.digests);
-	writeText(join(paths.digests, `${label}.md`), digestResult.text);
+	const digestText = drift ? `${digestResult.text}\ncontinuity: DRIFT — ${drift}` : digestResult.text;
+	writeText(join(paths.digests, `${label}.md`), digestText);
 
 	return {
 		label,
@@ -281,12 +292,13 @@ export async function runProbe(req: ProbeRequest): Promise<ProbeResult> {
 		wallMs,
 		usd: sessionUsd(jsonl),
 		sessionFile,
-		digest: digestResult.text,
+		digest: digestText,
 		digestCapped: digestResult.capped,
 		digestDropped: digestResult.dropped,
 		deliverables: deliverables.map((d) => d.rel),
 		diffStat,
 		verifier: verifierEvidence?.line,
+		drift,
 		error,
 	};
 }

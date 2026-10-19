@@ -35,8 +35,8 @@ export interface FlagSpec {
 }
 
 export const FLAGS: Record<Verb, FlagSpec> = {
-	start: { value: ["k", "domain", "mode"], bool: ["yes", "force"] },
-	probe: { value: ["k", "domain"], bool: [] },
+	start: { value: ["k", "domain", "mode"], bool: ["yes", "force", "replace"] },
+	probe: { value: ["k", "domain"], bool: ["replace"] },
 	status: { value: [], bool: [] },
 	watch: { value: ["lines"], bool: ["once", "follow"] },
 	stop: { value: [], bool: [] },
@@ -215,11 +215,11 @@ export interface VerbHelp {
 
 export const HELP: Record<Verb, VerbHelp> = {
 	start: {
-		usage: "start [--k n] [--domain d] [--mode parallel|sequential] [--yes] [--force] <task>",
+		usage: "start [--k n] [--domain d] [--mode parallel|sequential] [--yes] [--force] [--replace] <task>",
 		summary: "run the full loop (probe → propose → probe → compose → probe → adopt → reflect)",
 	},
 	probe: {
-		usage: "probe [--k n] [--domain d] <task>",
+		usage: "probe [--k n] [--domain d] [--replace] <task>",
 		summary: "reference executions + digests only — no editor, no edits, no adoption",
 	},
 	status: {

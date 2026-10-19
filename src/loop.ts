@@ -18,6 +18,13 @@ import type { RsiConfig } from "./config";
 import { formatMinutes } from "./config";
 import { BudgetError, type MissionPart } from "./context";
 import {
+	captureIdentity,
+	continuityPrompt,
+	describeIdentity,
+	type ProjectIdentity,
+	requestsReplacement,
+} from "./continuity";
+import {
 	buildMission,
 	composeParts,
 	type EditorStage,
@@ -107,6 +114,8 @@ export interface LoopOptions {
 	domain: string;
 	/** Run even when the working tree is dirty (adoption still checks it). */
 	force?: boolean;
+	/** Explicit opt-out of the continuity guard: allow replacing the project's subject. */
+	replace?: boolean;
 	signal?: AbortSignal;
 	io: LoopIO;
 	/** Pre-generated run id (tests pin it); defaults to a timestamp slug. */
@@ -139,6 +148,10 @@ interface RunContext {
 	cwd: string;
 	task: string;
 	domain: string;
+	/** What the project *is* before the run — inherited state the solver must continue. */
+	identity: ProjectIdentity;
+	/** Explicit subject-replacement opt-out (`--replace`). */
+	replace: boolean;
 	errors: string[];
 	budgetsUsed: Record<string, number>;
 	/** Live registry entry (/rsi watch) + merged abort signal (/rsi stop). */
@@ -175,7 +188,11 @@ function attachWatch(
 	return { watch: run, signal: run.controller.signal };
 }
 
-function createRun(opts: LoopOptions, kind: RunKind = "loop"): RunContext {
+function createRun(
+	opts: LoopOptions,
+	kind: RunKind = "loop",
+	identity: ProjectIdentity = captureIdentity(opts.cwd),
+): RunContext {
 	const runId = opts.runId ?? nowRunId(opts.task);
 	// A caller-supplied run id becomes a path segment (`runs/<id>`), so it must
 	// not be able to escape the runs directory.
@@ -218,6 +235,8 @@ function createRun(opts: LoopOptions, kind: RunKind = "loop"): RunContext {
 			cwd: opts.cwd,
 			task: opts.task,
 			domain: sanitizeSegment(opts.domain),
+			identity,
+			replace: opts.replace === true,
 			errors: [],
 			budgetsUsed: {},
 			watch: live.watch,
@@ -227,6 +246,11 @@ function createRun(opts: LoopOptions, kind: RunKind = "loop"): RunContext {
 		};
 		save(ctx);
 		writeText(join(runDir, "task.txt"), opts.task);
+		writeText(join(runDir, "base", "identity.json"), JSON.stringify(ctx.identity, null, "\t"));
+		note(
+			ctx,
+			`continuity: baseline ${describeIdentity(ctx.identity)}${ctx.replace ? " (replacement explicitly allowed)" : ""}`,
+		);
 		// Wall-clock budget: the USD cap is blind to free models, so a run that
 		// costs nothing can still burn an hour. The deadline aborts the run
 		// controller — every child gets `ctx.signal`, so the in-flight stage dies
@@ -301,9 +325,11 @@ function stopOutcome(ctx: RunContext): Outcome | null {
 	return null;
 }
 
-function solverPrompt(task: string): string {
+function solverPrompt(task: string, identity: ProjectIdentity, replace: boolean): string {
 	return [
 		"You are working in an isolated checkout of this project.",
+		"",
+		continuityPrompt(identity, replace),
 		"",
 		"Task:",
 		task,
@@ -337,12 +363,17 @@ async function probeSurface(
 		const result = await runProbe({
 			label,
 			sandbox,
-			prompt: solverPrompt(ctx.task),
+			prompt: solverPrompt(ctx.task, ctx.identity, ctx.replace),
 			runDir: ctx.runDir,
 			cfg,
+			identity: ctx.identity,
+			replace: ctx.replace,
 			signal: opts.signal,
 		});
 		addEntry(ctx.ledger, { kind: "rollout", label, usd: result.usd, attempts: 1, wallMs: result.wallMs });
+		if (result.drift) {
+			note(ctx, `continuity: ${label} replaced the project's subject — ${result.drift}`, "warn");
+		}
 		if (!result.ok) note(ctx, `rollout ${label} exited ${result.exitCode}: ${result.error ?? "unknown error"}`, "warn");
 		// The design promise is "nothing is silently truncated": a digest that had
 		// to drop sections must say so where the user reads the run, not only in
@@ -637,7 +668,11 @@ export function diversityOf(surfaces: readonly Surface[]): number | null {
 
 /** `/rsi probe <task>` — reference executions + digests only, zero edits (P0). */
 export async function runReferenceProbes(opts: LoopOptions): Promise<LoopReport> {
-	const ctx = createRun(opts, "probe");
+	// Same continuity pre-flight as `start`: probe spends model calls too, and a
+	// greenfield task on an existing project is refused before the first one.
+	const identity = captureIdentity(opts.cwd);
+	assertContinuityPreflight(opts.task, identity, opts.replace);
+	const ctx = createRun(opts, "probe", identity);
 	try {
 		const base = readSurface(opts.cwd, opts.cfg);
 		if (base["AGENTS.md"] === undefined) base["AGENTS.md"] = "# Project instructions\n";
@@ -663,6 +698,23 @@ export async function runReferenceProbes(opts: LoopOptions): Promise<LoopReport>
 	}
 }
 
+/**
+ * Continuity pre-flight: an existing project plus a task phrased as a greenfield
+ * replacement is almost always a misunderstanding. Refuse before spending a
+ * single model call; `--replace` is the explicit opt-out. Shared by `start` and
+ * `probe` so both verbs enforce the same contract.
+ */
+function assertContinuityPreflight(task: string, identity: ProjectIdentity, replace: boolean | undefined): void {
+	if (replace || identity.labels.length === 0) return;
+	const replacement = requestsReplacement(task, identity);
+	if (!replacement) return;
+	throw new Error(
+		`continuity guard: this task looks like a subject replacement (${replacement}). ` +
+			`The project already exists (${describeIdentity(identity)}); rephrase it as an improvement of that project. ` +
+			"Pass --replace only if a new subject is really intended.",
+	);
+}
+
 /** `/rsi <task>` — the full task-level recursion. */
 export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 	const cfg = opts.cfg;
@@ -673,7 +725,10 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		const status = workingTreeStatus(opts.cwd);
 		if (status.dirty) throw new DirtyTreeError(status);
 	}
-	const ctx = createRun(opts, "loop");
+	// Continuity pre-flight: refuse before creating any run state or probing.
+	const identity = captureIdentity(opts.cwd);
+	assertContinuityPreflight(opts.task, identity, opts.replace);
+	const ctx = createRun(opts, "loop", identity);
 
 	try {
 		// --- snapshot(base) -------------------------------------------------
@@ -785,9 +840,31 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		}
 
 		// --- select (k>1 only) ----------------------------------------------
+		// Continuity is a precondition for candidacy: a deliverable that replaced
+		// the project's subject is not a candidate for this project. Filter them
+		// out before the judge sees them; if none survive, fail closed.
+		const eligibleProbes = ctx.replace ? finalProbes : finalProbes.filter((probe) => !probe.drift);
+		const drifted = finalProbes.filter((probe) => probe.drift);
+		if (drifted.length > 0) {
+			note(
+				ctx,
+				`continuity: excluded ${drifted.map((probe) => probe.label).join(", ")} from selection (subject replacement)`,
+				"warn",
+			);
+		}
+		if (eligibleProbes.length === 0) {
+			note(ctx, "continuity guard: every final deliverable replaced the project's subject — nothing adopted", "error");
+			note(
+				ctx,
+				"keep the task an improvement of the current project, or pass --replace to allow a new subject",
+				"warn",
+			);
+			return finish(ctx, { outcome: "error", chosen: null, errors: true });
+		}
+
 		setStage(ctx.watch, "select");
 		const selection = await selectStage(ctx, {
-			finalProbes,
+			finalProbes: eligibleProbes,
 			composed,
 			signal: ctx.signal,
 		});
@@ -800,6 +877,21 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 
 		ctx.ledger.diversity = diversityOf(composed.map((c) => c.candidate.surface));
 		save(ctx);
+
+		// --- continuity guard -----------------------------------------------
+		// The run inherits the project on disk. A deliverable whose subject no
+		// longer matches the baseline is a replacement, not an improvement — fail
+		// closed before the adoption gate unless the run opted out with --replace.
+		const chosenProbe = finalProbes.find((probe) => probe.label === chosenLabel);
+		if (chosenProbe?.drift && !ctx.replace) {
+			note(ctx, `continuity guard: ${chosenLabel} replaced the project's subject — ${chosenProbe.drift}`, "error");
+			note(
+				ctx,
+				"nothing adopted: keep the task an improvement of the current project, or pass --replace to allow a new subject",
+				"warn",
+			);
+			return finish(ctx, { outcome: "error", chosen: chosenLabel, errors: true });
+		}
 
 		// --- adopt (human gate) ---------------------------------------------
 		setStage(ctx.watch, "adopt gate");
@@ -1100,6 +1192,7 @@ interface FinishOptions {
 function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 	ctx.clearDeadline?.();
 	ctx.ledger.outcome = opts.outcome;
+	ctx.ledger.endedAt = new Date().toISOString();
 	if (opts.outcome === "aborted")
 		note(ctx, "run interrupted via /rsi stop — nothing adopted, evidence kept under the run dir", "warn");
 	if (opts.outcome === "aborted_timeout") {
@@ -1133,6 +1226,7 @@ function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 				counters: ctx.ledger.counters,
 				budgetsUsed: ctx.budgetsUsed,
 				diversity: ctx.ledger.diversity,
+				continuity: { baseline: ctx.identity, replace: ctx.replace },
 				notes: ctx.ledger.notes,
 				errors: ctx.errors,
 			},
@@ -1321,6 +1415,8 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 		cwd: opts.cwd,
 		task: ledger.task,
 		domain: ledger.domain,
+		identity: captureIdentity(opts.cwd),
+		replace: true,
 		errors: [],
 		budgetsUsed: ledger.budgetsUsed,
 		watch: run.watch,

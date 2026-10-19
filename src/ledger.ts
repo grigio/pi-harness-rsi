@@ -52,6 +52,12 @@ export interface LedgerFile {
 	 * time next to USD, both as budgets. Optional: old ledgers predate it.
 	 */
 	startedAt?: string;
+	/**
+	 * Wall-clock end of the run (ISO), stamped when the outcome is final. Status
+	 * reports this duration instead of continuing to count wall time after the
+	 * run closed. Optional: old and in-flight ledgers do not have it.
+	 */
+	endedAt?: string;
 	outcome:
 		| "running"
 		| "probed"
@@ -162,10 +168,22 @@ export function totalUsd(ledger: LedgerFile): number {
 	return ledger.entries.reduce((sum, e) => sum + (Number.isFinite(e.usd) ? e.usd : 0), 0);
 }
 
-/** Wall-clock milliseconds since the run started, or 0 when the ledger predates `startedAt`. */
+/**
+ * Wall-clock milliseconds the run was (or has been) alive. A finished ledger
+ * measures to `endedAt`; an in-flight one measures to `now`. 0 when the ledger
+ * predates `startedAt`.
+ */
 export function elapsedMs(ledger: LedgerFile, now: number): number {
 	const start = Date.parse(ledger.startedAt ?? ledger.entries[0]?.ts ?? "");
 	if (!Number.isFinite(start)) return 0;
+	const end = Date.parse(ledger.endedAt ?? "");
+	if (Number.isFinite(end)) return Math.max(0, end - start);
+	// Legacy finished ledgers predate `endedAt`: approximate the end with the
+	// last recorded entry instead of counting wall time forever after the run.
+	if (ledger.outcome !== "running") {
+		const last = Date.parse(ledger.entries.at(-1)?.ts ?? "");
+		if (Number.isFinite(last)) return Math.max(0, last - start);
+	}
 	return Math.max(0, now - start);
 }
 
@@ -187,6 +205,13 @@ export interface StatusInput {
 	now?: number;
 }
 
+/** Outcomes that can legitimately stop before the loop's last stages. */
+function isIncomplete(outcome: LedgerFile["outcome"]): boolean {
+	return (
+		outcome === "running" || outcome === "aborted" || outcome === "aborted_timeout" || outcome === "aborted_budget"
+	);
+}
+
 /** Multi-line `/rsi status` report. Pure — the command only prints it. */
 export function renderStatus(input: StatusInput): string {
 	const { ledger, cfg } = input;
@@ -201,7 +226,11 @@ export function renderStatus(input: StatusInput): string {
 	} else {
 		lines.push(
 			`ledger: R ${identity.actual.R}/${identity.expected.R}  P ${identity.actual.P}/${identity.expected.P}` +
-				(identity.ok ? "  identity OK" : `  IDENTITY MISMATCH (${identity.problems.join("; ")})`),
+				(identity.ok
+					? "  identity OK"
+					: isIncomplete(ledger.outcome)
+						? `  incomplete (${ledger.outcome} before the last stages)`
+						: `  IDENTITY MISMATCH (${identity.problems.join("; ")})`),
 		);
 	}
 	const usdNote = cfg.maxUsdSource === "env" ? "env" : "setting";

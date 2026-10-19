@@ -29,8 +29,8 @@ One command, verb first. The verb may be omitted: then the whole line is a
 | Verb | What it does |
 | --- | --- |
 | *(none)* | **State view** — the in-flight run if there is one, otherwise the latest ledger and the exact command to type next. Never calls a model. |
-| `start <task>` | Full loop: probe → propose → probe → compose → probe → select → adopt → reflect. Flags: `--k <n>` `--domain <name>` `--mode parallel\|sequential` `--yes` `--force` |
-| `probe <task>` | Reference executions + digests only (no editor, no edits, no adoption). Flags: `--k <n>` `--domain <name>` |
+| `start <task>` | Full loop: probe → propose → probe → compose → probe → select → adopt → reflect. Flags: `--k <n>` `--domain <name>` `--mode parallel\|sequential` `--yes` `--force` `--replace` |
+| `probe <task>` | Reference executions + digests only (no editor, no edits, no adoption). Flags: `--k <n>` `--domain <name>` `--replace` |
 | `status [runId]` | The in-flight run, else the latest ledger: identity `R=4k, P=3k`, USD, fallbacks, diversity, budget usage. |
 | `watch [--once] [--lines <n>]` | Live view of the in-flight run: stage, elapsed, USD, latest notes — polls until the run closes. `--once` prints a single snapshot instead. |
 | `stop` | Interrupt the in-flight run before its normal end (see *Interruption* below). |
@@ -55,6 +55,47 @@ to look:
 Every command that changes state ends by printing exactly one command to type
 next, so the workflow is discoverable from the terminal (`/rsi` alone) and from
 the end of any run.
+
+## Continuity: existing projects are the baseline
+
+An RSI run is a **change to the project already on disk**, not a greenfield
+generator. It continues what is there instead of substituting a different
+project. That is enforced, not just asked for:
+
+- **Pre-flight (no model calls)**: when the project has an identity and the task
+  is phrased as a replacement ("turn the project into …", "start a new project",
+  "rewrite the page as …", or "turn <the file that names the project> into …"),
+  the run is refused and told to rephrase the task as an improvement — or to
+  pass `--replace` if a new subject is really intended.
+- At run start the harness captures the project's identity from the standard
+  files that name it: any manifest name (`package.json`, `pyproject.toml`,
+  `Cargo.toml`, `go.mod`, `pom.xml`, Gradle, `mix.exs`, …), the first README
+  heading, and a web entry page's `<title>`/`<h1>` when one exists. It is
+  written to `.pi/harness/runs/<id>/base/identity.json` and printed in the
+  ledger.
+- The solver prompt carries a **continuity contract**: the working tree is the
+  baseline; improve it, preserve its subject/name/main artifact, and report a
+  conflict instead of implementing a replacement.
+- After every rollout the sandbox is re-read and compared with the baseline.
+  If the subject no longer matches or the file that named the project
+  disappeared, the digest records `continuity: DRIFT` and the run **fails
+  closed before adoption** — nothing is applied.
+
+Replacing the subject is allowed, but must be explicit:
+
+```
+/rsi start --replace replace this project with a different one
+```
+
+`--replace` is the only way to opt out; it applies to `start` and `probe`.
+Projects with no explicit identity label are never blocked (there is nothing to
+compare), and generic projects are covered by the manifest/README sources — the
+check is not tied to any language, framework or file name.
+
+Note the boundary: `/rsi` adopts the **surface** (`AGENTS.md`, skills), never a
+project artifact. Deliverables under `evidence/deliverables/` are evidence for
+the editor, not files the harness applies — so “adopting” a replacement main
+artifact is always a separate, deliberate act.
 
 **Argument rules** (they are what keep the surface predictable):
 
@@ -161,7 +202,7 @@ pi --print "/rsi start --domain acme-api --yes $TASK"    # explicit opt-out of t
 calls, each capped by `stageTimeoutMs`); with small models that is typically a
 few tens of cents, and the run aborts fail-closed at `maxUsd` (default $2).
 Because a free model spends `$0` and still takes time, a run is also capped by a
-wall clock: `maxRunMinutes` (default **5**, `PI_RSI_MAX_MINUTES` to override)
+wall clock: `maxRunMinutes` (default **30**, `PI_RSI_MAX_MINUTES` to override)
 ends the run with `outcome: aborted_timeout`, killing the in-flight stage rather
 than waiting for the next one. `--k 2` doubles both sides of the identity
 (R=8, P=6) and buys a real selection stage. `PI_RSI_FAKE=1` exercises the entire
@@ -200,7 +241,7 @@ $ cd ~/code/acme-api && pi
   → the digest shows the real defect: 2 identical greps, 2 failing checks, no re-read.
 
 ▸ /rsi start --domain acme-api run the verifier after every edit and re-read files before the next edit
-  rsi: profile=small k=1 mode=parallel fake=0 maxUsd=2 maxRun=5m confirmAdopt=1
+  rsi: profile=small k=1 mode=parallel fake=0 maxUsd=2 maxRun=30m confirmAdopt=1
   [rsi] final0: # digest: final0 (model=…, 88s, turns=9) — diff 2 file(s) changed
   rsi: adopt final0?
       adopt final0: added 2, removed 0, modified 1, always-on Δ +312 chars, surface Δ +1 104 chars
@@ -327,7 +368,7 @@ Profile `large` doubles these (set `rsi.profile`).
     "confirmAdopt": true,        // keep the P6 human gate on
     "requireClean": true,        // refuse to start on a dirty tree (unless --force)
     "maxUsd": 2,
-    "maxRunMinutes": 5,          // wall-clock cap for the whole run (free models spend $0 but still take time)
+    "maxRunMinutes": 30,         // wall-clock cap for the whole run (free models spend $0 but still take time)
     "maxParallel": 2,
     "libraryDir": ".pi/harness/library",   // absolute or repo-relative
     "worktreeRoot": ".pi/harness/worktrees",
@@ -347,6 +388,10 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_MAX_MINUTES`, `PI_RSI_PI_BIN`
 
 - **P6**: adoption only through the confirm gate (`/rsi adopt --yes` to opt out
   explicitly); a dirty working tree refuses adoption unless `--force`.
+- **Continuity (inherited projects)**: a run continues the project on disk. The
+  baseline identity is captured before the first probe; a deliverable that
+  replaces the subject (or deletes the artifact that named it) closes the run as
+  `error` before the adoption gate. `--replace` is the explicit opt-out.
 - **Revert is guarded too**: `/rsi revert <domain>/<slug>` applies the snapshot
   inside the same transaction as adoption — dirty-tree check (`--force` to
   override), cross-process run lock, re-validation, and restore-on-throw — so a

@@ -189,6 +189,58 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 			}),
 		).rejects.toThrow(/in flight/);
 	});
+
+	test("continuity pre-flight refuses a greenfield task on an existing project", async () => {
+		const cwd = makeCwd();
+		writeFileSync(
+			join(cwd, "index.html"),
+			"<!doctype html><html><head><title>Color Changing Heart</title></head><body></body></html>",
+		);
+		await expect(
+			runLoop({
+				cfg: fakeCfg(),
+				cwd,
+				task: "Turn index.html into an amazing interactive 3D solar system",
+				domain: "demo",
+				force: true,
+				runId: "continuity-refused",
+				io: { log: () => {}, confirmAdoption: async () => true },
+			}),
+		).rejects.toThrow(/continuity guard/);
+		// refused before spending a model call or creating run state
+		expect(existsSync(join(cwd, ".pi", "harness", "runs", "continuity-refused"))).toBe(false);
+	});
+
+	test("continuity pre-flight applies to probe too (it spends model calls)", async () => {
+		const cwd = makeCwd();
+		writeFileSync(
+			join(cwd, "index.html"),
+			"<!doctype html><html><head><title>Color Changing Heart</title></head></html>",
+		);
+		await expect(
+			runReferenceProbes({
+				cfg: fakeCfg(),
+				cwd,
+				task: "Turn index.html into an amazing interactive 3D solar system",
+				domain: "demo",
+				runId: "probe-continuity-refused",
+				io: { log: () => {} },
+			}),
+		).rejects.toThrow(/continuity guard/);
+		expect(existsSync(join(cwd, ".pi", "harness", "runs", "probe-continuity-refused"))).toBe(false);
+
+		// ...unless the replacement is explicit
+		const replaced = await runReferenceProbes({
+			cfg: fakeCfg(),
+			cwd,
+			task: "Turn index.html into an amazing interactive 3D solar system",
+			domain: "demo",
+			replace: true,
+			runId: "probe-continuity-replaced",
+			io: { log: () => {} },
+		});
+		expect(replaced.outcome).toBe("probed");
+	}, 60_000);
 });
 
 test("ledger identity math: R=4k, P=3k, selection/reflection uncounted", () => {

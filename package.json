@@ -20,6 +20,7 @@
 		"test": "bun test",
 		"typecheck": "bunx tsc -p tsconfig.json",
 		"lint": "biome check index.ts src test",
+		"check": "bun run typecheck && bun run lint && bun test",
 		"format": "biome check --write index.ts src test"
 	},
 	"peerDependencies": {

@@ -160,8 +160,12 @@ pi --print "/rsi start --domain acme-api --yes $TASK"    # explicit opt-out of t
 **Cost & knobs:** a k=1 run is 4 solver probes + 3 editor sessions (7 child-`pi`
 calls, each capped by `stageTimeoutMs`); with small models that is typically a
 few tens of cents, and the run aborts fail-closed at `maxUsd` (default $2).
-`--k 2` doubles both sides of the identity (R=8, P=6) and buys a real selection
-stage. `PI_RSI_FAKE=1` exercises the entire loop with **zero** model calls.
+Because a free model spends `$0` and still takes time, a run is also capped by a
+wall clock: `maxRunMinutes` (default **5**, `PI_RSI_MAX_MINUTES` to override)
+ends the run with `outcome: aborted_timeout`, killing the in-flight stage rather
+than waiting for the next one. `--k 2` doubles both sides of the identity
+(R=8, P=6) and buys a real selection stage. `PI_RSI_FAKE=1` exercises the entire
+loop with **zero** model calls.
 
 ## Example workflow
 
@@ -196,7 +200,7 @@ $ cd ~/code/acme-api && pi
   → the digest shows the real defect: 2 identical greps, 2 failing checks, no re-read.
 
 ▸ /rsi start --domain acme-api run the verifier after every edit and re-read files before the next edit
-  rsi: profile=small k=1 mode=parallel fake=0 maxUsd=2 confirmAdopt=1
+  rsi: profile=small k=1 mode=parallel fake=0 maxUsd=2 maxRun=5m confirmAdopt=1
   [rsi] final0: # digest: final0 (model=…, 88s, turns=9) — diff 2 file(s) changed
   rsi: adopt final0?
       adopt final0: added 2, removed 0, modified 1, always-on Δ +312 chars, surface Δ +1 104 chars
@@ -323,6 +327,7 @@ Profile `large` doubles these (set `rsi.profile`).
     "confirmAdopt": true,        // keep the P6 human gate on
     "requireClean": true,        // refuse to start on a dirty tree (unless --force)
     "maxUsd": 2,
+    "maxRunMinutes": 5,          // wall-clock cap for the whole run (free models spend $0 but still take time)
     "maxParallel": 2,
     "libraryDir": ".pi/harness/library",   // absolute or repo-relative
     "worktreeRoot": ".pi/harness/worktrees",
@@ -334,8 +339,8 @@ Profile `large` doubles these (set `rsi.profile`).
 }
 ```
 
-Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
-`PI_RSI_FAKE=1` + `PI_RSI_FAKE_SCENARIO=valid|invalid-first|always-invalid`
+Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_MAX_MINUTES`, `PI_RSI_PI_BIN`
+(child binary), `PI_RSI_FAKE=1` + `PI_RSI_FAKE_SCENARIO=valid|invalid-first|always-invalid`
 (deterministic loop, **zero model calls**).
 
 ## Safety model
@@ -360,11 +365,13 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
   shows the live stage, spend and notes (it tails until the run closes; `--once`
   prints a snapshot), with a ledger-backed disk view for runs started in another
   session.
-- **Budget check granularity**: `rsi.maxUsd` (and `/rsi stop`) are evaluated at
-  stage boundaries, not mid-rollout, so a stage that already launched its
-  parallel children can overshoot the cap by one stage's spend before the run
-  aborts fail-closed. Crashed children that never report provider cost count as
-  $0 — keep `maxUsd` a real ceiling, not the exact spend.
+- **Budget check granularity**: `rsi.maxUsd` is evaluated at stage boundaries,
+  not mid-rollout, so a stage that already launched its parallel children can
+  overshoot the cap by one stage's spend before the run aborts fail-closed.
+  Crashed children that never report provider cost count as $0 — keep `maxUsd` a
+  real ceiling, not the exact spend. The wall-clock cap (`rsi.maxRunMinutes`) is
+  the budget that binds when spend is $0: its timer aborts the run signal, so
+  the in-flight child is killed immediately rather than at the next boundary.
 - **Retention**: each new run prunes run dirs beyond `rsi.keepRuns` — but only
   runs that are old *and* decided; anything awaiting `/rsi adopt` (and the
   in-flight run) is never deleted, so the raw evidence a lesson came from

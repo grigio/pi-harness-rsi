@@ -5,7 +5,8 @@
  * The loop owns the entry (`beginRun` in `createRun`, `endRun` in `finish`);
  * commands only read the snapshot or abort the controller. Aborting SIGTERMs
  * the current child-`pi` call (see `probe.ts`) and the loop closes at the next
- * stage boundary with outcome `aborted_budget` (spend) or `aborted` (stop via
+ * stage boundary with outcome `aborted_budget` (spend), `aborted_timeout`
+ * (wall clock) or `aborted` (stop via
  * `/rsi stop` or a STOP sentinel) — nothing is half-applied and the run dir
  * stays auditable like any other run.
  *

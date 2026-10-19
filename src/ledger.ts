@@ -11,6 +11,7 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
+import { formatMinutes } from "./config";
 import { ensureDir, exists, readTextIf, writeText } from "./util";
 
 export type LedgerKind = "rollout" | "session" | "selection" | "reflection";
@@ -46,6 +47,11 @@ export interface LedgerFile {
 	budgetsUsed: Record<string, number>;
 	/** Mean line-Jaccard across composed candidates (mode-collapse detector). */
 	diversity: number | null;
+	/**
+	 * Wall-clock start of the run (ISO). The status view uses it to report elapsed
+	 * time next to USD, both as budgets. Optional: old ledgers predate it.
+	 */
+	startedAt?: string;
 	outcome:
 		| "running"
 		| "probed"
@@ -54,6 +60,7 @@ export interface LedgerFile {
 		| "no_change"
 		| "fell_back"
 		| "aborted_budget"
+		| "aborted_timeout"
 		| "aborted"
 		| "error";
 	/**
@@ -91,6 +98,7 @@ export function newLedger(
 		budgetsUsed: {},
 		diversity: null,
 		outcome: "running",
+		startedAt: new Date().toISOString(),
 		owner: { pid: process.pid, host: hostname() },
 		chosen: null,
 		adopted: false,
@@ -154,11 +162,29 @@ export function totalUsd(ledger: LedgerFile): number {
 	return ledger.entries.reduce((sum, e) => sum + (Number.isFinite(e.usd) ? e.usd : 0), 0);
 }
 
+/** Wall-clock milliseconds since the run started, or 0 when the ledger predates `startedAt`. */
+export function elapsedMs(ledger: LedgerFile, now: number): number {
+	const start = Date.parse(ledger.startedAt ?? ledger.entries[0]?.ts ?? "");
+	if (!Number.isFinite(start)) return 0;
+	return Math.max(0, now - start);
+}
+
+/** `192000` → `3m12s`, `7400` → `7s` — the elapsed half of the time budget line. */
+export function formatElapsed(ms: number): string {
+	const totalSeconds = Math.floor(ms / 1000);
+	const seconds = totalSeconds % 60;
+	const minutes = Math.floor(totalSeconds / 60);
+	if (minutes === 0) return `${seconds}s`;
+	return `${minutes}m${String(seconds).padStart(2, "0")}s`;
+}
+
 export interface StatusInput {
 	ledger: LedgerFile;
 	cfg: RsiConfig;
 	/** Mission text sizes for the stages that ran. */
 	budgetsUsed?: Record<string, number>;
+	/** Injectable clock (tests); defaults to `Date.now()`. */
+	now?: number;
 }
 
 /** Multi-line `/rsi status` report. Pure — the command only prints it. */
@@ -180,6 +206,7 @@ export function renderStatus(input: StatusInput): string {
 	}
 	const usdNote = cfg.maxUsdSource === "env" ? "env" : "setting";
 	lines.push(`usd: ${spent.toFixed(4)} / max ${cfg.maxUsd} (${usdNote})`);
+	lines.push(`time: ${formatElapsed(elapsedMs(ledger, input.now ?? Date.now()))} / max ${formatMinutes(cfg.maxRunMs)}`);
 	lines.push(
 		`kept_base: ${ledger.counters.keptBase}  fell_back: ${ledger.counters.fellBack}  ` +
 			`tripwire: ${ledger.counters.tripwire}  editor_errors: ${ledger.counters.editorErrors}`,

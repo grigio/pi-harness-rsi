@@ -97,3 +97,41 @@ describe("/rsi stop during candidate probes (regression)", () => {
 		}
 	}, 40_000);
 });
+
+describe("wall-clock budget (the USD cap is blind to free models)", () => {
+	test("a run past maxRun aborts as aborted_timeout and kills the in-flight child", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "rsi-deadline-"));
+		writeFileSync(join(cwd, "README.md"), "# demo\n");
+		const bin = writeStub();
+		const previous = process.env.PI_RSI_PI_BIN;
+		process.env.PI_RSI_PI_BIN = bin;
+		try {
+			// The stub's candidate runs sleep 60s; a 1.2s wall-clock budget aborts
+			// the run long before that, and long before the 3s stage timeout.
+			const cfg = {
+				...resolveConfig({ profile: "small", k: 1, maxParallel: 2, stageTimeoutMs: 3_000 }, {
+					PI_RSI_MAX_MINUTES: "0.02",
+				} as NodeJS.ProcessEnv),
+				fake: false,
+			};
+			expect(cfg.maxRunSource).toBe("env");
+			const started = Date.now();
+			const report = await runLoop({
+				cfg,
+				cwd,
+				task: "keep the checks green",
+				domain: "demo",
+				force: true,
+				runId: "deadline",
+				io: { log: () => {}, confirmAdoption: async () => true },
+			});
+			expect(report.outcome).toBe("aborted_timeout");
+			expect(report.adopted).toBe(false);
+			expect(Date.now() - started).toBeLessThan(15_000);
+			expect(report.status).toContain("time:");
+		} finally {
+			if (previous === undefined) delete process.env.PI_RSI_PI_BIN;
+			else process.env.PI_RSI_PI_BIN = previous;
+		}
+	}, 40_000);
+});

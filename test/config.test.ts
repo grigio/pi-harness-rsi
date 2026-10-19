@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MIN_USD, resolveConfig } from "../src/config";
+import { describeConfig, formatMinutes, MIN_USD, resolveConfig } from "../src/config";
 
 const env = {} as NodeJS.ProcessEnv;
 
@@ -34,5 +34,32 @@ describe("resolveConfig — money and counts that must not silently floor to zer
 	test("the env escape hatch honours any positive value", () => {
 		expect(resolveConfig({ maxUsd: 100 }, { PI_RSI_MAX_USD: "0.02" } as NodeJS.ProcessEnv).maxUsd).toBe(0.02);
 		expect(resolveConfig({ maxUsd: 100 }, { PI_RSI_MAX_USD: "0" } as NodeJS.ProcessEnv).maxUsd).toBe(100);
+	});
+});
+
+describe("resolveConfig — wall-clock budget (free models make USD meaningless)", () => {
+	test("the default is 5 minutes", () => {
+		expect(resolveConfig({}, env).maxRunMs).toBe(5 * 60_000);
+	});
+
+	test("maxRunMinutes is honoured, with a floor against an unusable setting", () => {
+		expect(resolveConfig({ maxRunMinutes: 20 }, env).maxRunMs).toBe(20 * 60_000);
+		expect(resolveConfig({ maxRunMinutes: 1.5 }, env).maxRunMs).toBe(90_000);
+		expect(resolveConfig({ maxRunMinutes: 0 }, env).maxRunMs).toBe(5 * 60_000);
+		expect(resolveConfig({ maxRunMinutes: 0.01 }, env).maxRunMs).toBe(60_000); // below MIN_MAX_RUN_MS
+	});
+
+	test("PI_RSI_MAX_MINUTES overrides the setting (escape hatch, any positive value)", () => {
+		const overridden = resolveConfig({ maxRunMinutes: 20 }, { PI_RSI_MAX_MINUTES: "0.5" } as NodeJS.ProcessEnv);
+		expect(overridden.maxRunMs).toBe(30_000);
+		expect(overridden.maxRunSource).toBe("env");
+		expect(resolveConfig({ maxRunMinutes: 20 }, { PI_RSI_MAX_MINUTES: "0" } as NodeJS.ProcessEnv).maxRunMs).toBe(
+			20 * 60_000,
+		);
+	});
+
+	test("describeConfig surfaces the limit next to the USD cap", () => {
+		expect(describeConfig(resolveConfig({ maxRunMinutes: 5 }, env))).toContain("maxRun=5m");
+		expect(formatMinutes(90_000)).toBe("1.5m");
 	});
 });

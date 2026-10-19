@@ -15,6 +15,7 @@
 
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
+import { formatMinutes } from "./config";
 import { BudgetError, type MissionPart } from "./context";
 import {
 	buildMission,
@@ -148,6 +149,14 @@ interface RunContext {
 	clean: boolean;
 	/** Releases the cross-process run lock; idempotent. */
 	releaseLock: () => void;
+	/**
+	 * Set when the run-level wall-clock deadline fired (see `clearDeadline`).
+	 * Checked before the abort signal so a timeout is reported as such and not as
+	 * a `/rsi stop`.
+	 */
+	timeExpired?: boolean;
+	/** Cancels the wall-clock deadline timer (finish / adopt paths). */
+	clearDeadline?: () => void;
 }
 
 /**
@@ -218,6 +227,21 @@ function createRun(opts: LoopOptions, kind: RunKind = "loop"): RunContext {
 		};
 		save(ctx);
 		writeText(join(runDir, "task.txt"), opts.task);
+		// Wall-clock budget: the USD cap is blind to free models, so a run that
+		// costs nothing can still burn an hour. The deadline aborts the run
+		// controller — every child gets `ctx.signal`, so the in-flight stage dies
+		// promptly — and `stopOutcome` closes the run as `aborted_timeout`.
+		const deadline = setTimeout(() => {
+			ctx.timeExpired = true;
+			note(
+				ctx,
+				`time stop: reached maxRun=${formatMinutes(ctx.cfg.maxRunMs)} — aborting the in-flight stage, keeping the current surface`,
+				"warn",
+			);
+			ctx.watch.controller.abort();
+		}, opts.cfg.maxRunMs);
+		deadline.unref?.();
+		ctx.clearDeadline = () => clearTimeout(deadline);
 		if (pruned.removed.length > 0) {
 			note(ctx, `retention: pruned ${pruned.removed.length} old run(s), keepRuns=${opts.cfg.keepRuns}`);
 		}
@@ -263,8 +287,15 @@ function outOfBudget(ctx: RunContext): boolean {
 	return false;
 }
 
+/** Wall-clock stop: same hard-stop semantics as the USD budget, but time-based. */
+function outOfTime(ctx: RunContext): boolean {
+	if (!ctx.timeExpired) return false;
+	return true;
+}
+
 /** User interruption (`/rsi stop`, or a `STOP` file from another session) wins over the budget check; both fail closed. */
 function stopOutcome(ctx: RunContext): Outcome | null {
+	if (outOfTime(ctx)) return "aborted_timeout";
 	if (ctx.signal.aborted || exists(join(ctx.runDir, STOP_FILE))) return "aborted";
 	if (outOfBudget(ctx)) return "aborted_budget";
 	return null;
@@ -774,7 +805,8 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		setStage(ctx.watch, "adopt gate");
 		const gate = await resolveAdoptionGate(ctx, chosenLabel, chosenEntry.candidate.surface, base, opts);
 		if (!gate.ok) {
-			if (gate.stopped) return finish(ctx, { outcome: "aborted", chosen: chosenLabel });
+			if (gate.stopped)
+				return finish(ctx, { outcome: ctx.timeExpired ? "aborted_timeout" : "aborted", chosen: chosenLabel });
 			if (gate.noChange) return finish(ctx, { outcome: "no_change", chosen: chosenLabel });
 			return finish(ctx, { outcome: gate.aborted ? "error" : "pending", chosen: chosenLabel, errors: gate.aborted });
 		}
@@ -784,7 +816,8 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		ctx.errors.push(message);
 		note(ctx, `error: ${message}`, "error");
 		const aborted = err instanceof BudgetError;
-		return finish(ctx, { outcome: aborted ? "aborted_budget" : "error", errors: true });
+		const outcome: Outcome = ctx.timeExpired ? "aborted_timeout" : aborted ? "aborted_budget" : "error";
+		return finish(ctx, { outcome, errors: outcome === "error" });
 	}
 }
 
@@ -1065,9 +1098,17 @@ interface FinishOptions {
 }
 
 function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
+	ctx.clearDeadline?.();
 	ctx.ledger.outcome = opts.outcome;
 	if (opts.outcome === "aborted")
 		note(ctx, "run interrupted via /rsi stop — nothing adopted, evidence kept under the run dir", "warn");
+	if (opts.outcome === "aborted_timeout") {
+		note(
+			ctx,
+			`run hit the wall-clock limit (${formatMinutes(ctx.cfg.maxRunMs)}) — nothing adopted, evidence kept under the run dir`,
+			"warn",
+		);
+	}
 	if (opts.chosen !== undefined) ctx.ledger.chosen = opts.chosen;
 	if (opts.adopted) ctx.ledger.adopted = true;
 	save(ctx);

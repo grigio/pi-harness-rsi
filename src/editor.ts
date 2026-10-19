@@ -263,12 +263,34 @@ export class ReplyParseError extends Error {}
 
 export function parseEdits(reply: string, cfg: RsiConfig): ParsedEdits {
 	const raw = extractTag(reply, "edits");
-	const jsonPayload = raw ?? fencedJson(reply);
-	if (!jsonPayload) {
+	if (raw !== undefined) return parseEditsJson(stripFence(raw), reply, cfg);
+	// No `<edits>` tag: recover the JSON object without trusting fences. A fenced
+	// `json` block is the documented shape, but a *file's content* can itself
+	// contain a ``` block (an `AGENTS.md` documenting a `bash` example). The
+	// non-greedy fence regex then closes the payload at that inner fence and
+	// truncates the JSON mid-string ("Unterminated string"), losing a stage to
+	// two parse retries and a fallback to the base surface. Brace-balance first,
+	// and keep the fence as a fallback for replies that are not brace-parseable.
+	const balanced = balancedJsonObject(reply);
+	const fenced = fencedJson(reply);
+	const payloads = [balanced, fenced].filter((p): p is string => p !== undefined);
+	if (payloads.length === 0) {
 		throw new ReplyParseError(
 			`no <edits>…</edits> block and no fenced \`\`\`json object found in the reply — reply with <notes>…</notes> followed by a \`\`\`json block containing {"files": [...]}`,
 		);
 	}
+	let lastError: unknown;
+	for (const payload of payloads) {
+		try {
+			return parseEditsJson(payload, reply, cfg);
+		} catch (err) {
+			lastError = err;
+		}
+	}
+	throw lastError;
+}
+
+function parseEditsJson(jsonPayload: string, reply: string, cfg: RsiConfig): ParsedEdits {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(stripFence(jsonPayload));
@@ -298,6 +320,33 @@ export function parseEdits(reply: string, cfg: RsiConfig): ParsedEdits {
 	}
 	const notes = capNotes(typeof obj.notes === "string" ? obj.notes : (extractTag(reply, "notes") ?? ""), cfg.budgets);
 	return { notes, delta: { files, notes } };
+}
+
+/**
+ * First balanced `{…}` object in `text`, following brace depth while skipping
+ * string literals and their escapes — so braces and fences *inside* a file's
+ * content never unbalance the scan. `undefined` when the text holds no complete
+ * object (the caller then reports the actionable retry shape).
+ */
+export function balancedJsonObject(text: string): string | undefined {
+	const start = text.indexOf("{");
+	if (start < 0) return undefined;
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let i = start; i < text.length; i++) {
+		const ch = text[i] as string;
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (ch === "\\") escaped = true;
+			else if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') inString = true;
+		else if (ch === "{") depth++;
+		else if (ch === "}" && --depth === 0) return text.slice(start, i + 1);
+	}
+	return undefined;
 }
 
 function fencedJson(reply: string): string | undefined {

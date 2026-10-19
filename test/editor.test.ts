@@ -45,6 +45,23 @@ describe("editor.parseEdits — the fail-closed reply boundary", () => {
 		}
 	});
 
+	test("a fenced json block whose content contains a ``` fence still parses", () => {
+		// Real failure (run 20261019-133713): the compose editor wrote an
+		// `AGENTS.md` that documents a ```bash example. The non-greedy fence regex
+		// closed the payload at that inner fence, truncating the JSON mid-string
+		// ("Unterminated string") — two failed attempts, then a fallback to the
+		// base surface instead of the improvement.
+		const content = "# AGENTS\n\nRun the check:\n\n```bash\nnode verify.mjs\n```\n";
+		const reply = [
+			"<notes>added a verifier habit</notes>",
+			"```json",
+			JSON.stringify({ files: [{ path: "AGENTS.md", op: "write", content }] }),
+			"```",
+		].join("\n");
+		const parsed = parseEdits(reply, cfg);
+		expect(parsed.delta.files).toEqual([{ path: "AGENTS.md", op: "write", content }]);
+	});
+
 	test("invalid JSON is rejected verbatim", () => {
 		expect(() => parseEdits('<edits>{"files": [}</edits>', cfg)).toThrow(/not valid JSON/);
 	});

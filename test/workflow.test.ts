@@ -29,6 +29,14 @@ describe("development workflow contract", () => {
 		expect([...order].sort((a, b) => a - b)).toEqual(order);
 	});
 
+	test("CI runs the same single gate, not a drifting copy of it", () => {
+		const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+		expect(ci).toContain("bun run check");
+		// CI must not re-list the individual steps: that is how the two drift apart.
+		expect(ci).not.toContain("bun run typecheck");
+		expect(ci).not.toContain("run: bun test");
+	});
+
 	test("AGENTS.md documents the same gate", () => {
 		const agents = readFileSync(join(root, "AGENTS.md"), "utf8");
 		expect(agents).toContain("bunx tsc -p tsconfig.json");

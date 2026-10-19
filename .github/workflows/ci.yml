@@ -14,9 +14,7 @@ jobs:
           bun-version: 1.4.3
       - name: Install
         run: bun install --frozen-lockfile
-      - name: Typecheck
-        run: bun run typecheck
-      - name: Lint & format check
-        run: bun run lint
-      - name: Test
-        run: bun test
+      # One command, identical to the local finish gate (`AGENTS.md`): typecheck,
+      # lint and test in order, so CI and the documented workflow cannot drift.
+      - name: Gate
+        run: bun run check

@@ -301,7 +301,10 @@ export function parseEdits(reply: string, cfg: RsiConfig): ParsedEdits {
 }
 
 function fencedJson(reply: string): string | undefined {
-	const m = reply.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+	// Models routinely close the fence on the same line as the last JSON token
+	// (`…}```) instead of a fresh line. Requiring that newline rejected a valid
+	// reply and forced a retry (or a fallback to the base surface).
+	const m = reply.match(/```(?:json)?[ \t]*\r?\n?([\s\S]*?)\r?\n?[ \t]*```/);
 	return m ? m[1] : undefined;
 }
 
@@ -342,7 +345,7 @@ function parseLooseExperience(raw: string): unknown {
 }
 
 export function parseChoice(reply: string, pool: readonly string[]): string {
-	const fence = reply.match(/```(?:choice)?\s*\n([\s\S]*?)\n```/);
+	const fence = reply.match(/```(?:choice)?[ \t]*\r?\n?([\s\S]*?)\r?\n?[ \t]*```/);
 	const candidate = (fence?.[1] ?? reply).trim().split(/\s+/)[0] ?? "";
 	if (pool.includes(candidate)) return candidate;
 	throw new ReplyParseError(
@@ -405,7 +408,48 @@ export async function runEditor(opts: RunEditorOptions): Promise<EditorRun> {
 			missionPath: opts.missionPath,
 		};
 	}
+	// A provider failure (429, auth, network) ends the child with a normal exit
+	// and an empty assistant message. Reporting that as an "unparsable reply"
+	// hides the real cause and spends the one retry immediately, so surface it
+	// as an editor error with the provider's own message.
+	if (reply.trim().length === 0) {
+		const failure = sessionFailure(jsonl);
+		if (failure) {
+			return {
+				ok: false,
+				reply: "",
+				usd: sessionUsd(jsonl),
+				wallMs: run.wallMs,
+				error: failure,
+				mission,
+				missionPath: opts.missionPath,
+			};
+		}
+	}
 	return { ok: true, reply, usd: sessionUsd(jsonl), wallMs: run.wallMs, mission, missionPath: opts.missionPath };
+}
+
+/**
+ * Provider/agent failure recorded in a child session (e.g. `stopReason: "error"`
+ * with an `errorMessage`), or undefined when the run simply produced no text.
+ */
+export function sessionFailure(jsonl: string): string | undefined {
+	for (const line of jsonl.split("\n")) {
+		if (line.trim().length === 0) continue;
+		try {
+			const entry = JSON.parse(line) as {
+				type?: string;
+				message?: { role?: string; stopReason?: string; errorMessage?: string; content?: unknown };
+			};
+			if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
+			if (entry.message.stopReason !== "error") continue;
+			const msg = entry.message.errorMessage?.trim();
+			return msg && msg.length > 0 ? `model error: ${msg}` : "model error: the assistant turn ended with an error";
+		} catch {
+			// ignore unparsable lines
+		}
+	}
+	return undefined;
 }
 
 /** Last assistant text block — the editor's answer. */

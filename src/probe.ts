@@ -10,11 +10,12 @@
  * session so the whole loop runs with zero model calls.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { fakeSessionJsonl } from "./fake";
+import { capture, killTree } from "./proc";
 import { digest, sessionUsd, writtenPaths } from "./trajectory";
 import { ensureDir, readTextIf, relPosix, rmrf, toPosix, writeText } from "./util";
 import { runVerifier, type Sandbox } from "./worktree";
@@ -47,32 +48,27 @@ export function buildChildArgs(opts: {
 	/** Editor runs are answer-only and context-minimal. */
 	editor?: boolean;
 }): string[] {
-	const args = ["--mode", "json", "--approve", "--session-dir", opts.sessionDir, "--tools", opts.tools.join(",")];
-	if (opts.editor) args.push("--no-context-files");
+	const args = ["--mode", "json", "--session-dir", opts.sessionDir, "--tools", opts.tools.join(",")];
+	if (opts.editor) {
+		// The editor is answer-only: it reads the run dir and replies with tags.
+		//
+		// It must not inherit *project* trust or discover the host project's
+		// context files/skills — those cost context and add attack surface for a
+		// stage that never needs them. `--no-approve` is what blocks project-local
+		// resources; `--no-extensions` must NOT be passed: it also disables the
+		// user-installed provider extensions (e.g. `opencode-free`), so the
+		// configured model cannot be resolved and pi silently falls back to an
+		// unrelated local model — the editor then emits an unparsable reply.
+		args.push("--no-context-files", "--no-skills", "--no-prompt-templates", "--no-approve");
+	} else {
+		// Solvers run in an extension-created sandbox and must see the staged
+		// surface (AGENTS.md, .pi/skills) exactly as the harness would.
+		args.push("--approve");
+	}
 	if (opts.model) args.push("--model", opts.model);
 	if (opts.thinking) args.push("--thinking", opts.thinking);
 	args.push(opts.prompt);
 	return args;
-}
-
-/**
- * SIGTERM the whole child process group — `child.kill()` only signals the
- * direct child, so a sandbox `pi` that spawned bash/tool grandchildren would
- * survive a timeout or `/rsi-stop`. `detached: true` (POSIX) makes the child a
- * group leader, so `-pid` reaches the tree; the fallback covers platforms that
- * reject negative pids.
- */
-function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
-	if (child.pid === undefined) return;
-	try {
-		process.kill(-child.pid, signal);
-	} catch {
-		try {
-			child.kill(signal);
-		} catch {
-			// already gone
-		}
-	}
 }
 
 export function spawnPi(
@@ -114,10 +110,10 @@ export function spawnPi(
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
 		child.stdout.on("data", (chunk: string) => {
-			stdout += chunk;
+			stdout = capture(stdout, chunk);
 		});
 		child.stderr.on("data", (chunk: string) => {
-			stderr += chunk;
+			stderr = capture(stderr, chunk);
 		});
 
 		const finish = (code: number, error?: string): void => {
@@ -261,8 +257,8 @@ export async function runProbe(req: ProbeRequest): Promise<ProbeResult> {
 	const touched = writtenPaths(jsonl);
 	const deliverables = harvestDeliverables(sandbox.path, touched, join(paths.deliverables, label));
 
-	const verifierEvidence = runVerifier(sandbox.path, cfg);
-	const diffStat = sandbox.diffStat();
+	const verifierEvidence = await runVerifier(sandbox.path, cfg, req.signal);
+	const diffStat = await sandbox.diffStat();
 
 	const relPointer = toPosix(join("evidence", "rollouts", `${label}.jsonl`));
 	const digestResult = digest({

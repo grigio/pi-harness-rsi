@@ -96,21 +96,30 @@ export function assemble(stage: MissionStage, parts: readonly MissionPart[], bud
 	}
 
 	// Pass 3: optional parts, whole-or-nothing. Optional content may never
-	// raise: if a part (and later even its drop-notice) will not fit, the part is
-	// dropped whole and the run continues with what already fits.
-	for (const part of parts) {
-		if (!part.optional) continue;
-		const size = charLen(chunkOf(part)) + 2;
-		if (charLen(text) + size <= budget) {
-			text = `${text}\n\n${chunkOf(part)}`;
-			continue;
+	// raise: if a part does not fit, it is dropped whole and the run continues
+	// with what already fits. Space for the drop-notice is reserved up front
+	// (worst case: every optional part drops) so a drop is never silent —
+	// README: "dropped whole with a `## dropped-over-budget` notice".
+	const optional = parts.filter((p) => p.optional);
+	if (optional.length > 0) {
+		const worstNotice = noticeOf(optional.map((p) => p.name));
+		const reserve = charLen(worstNotice) + 2;
+		// When even the mandatory text leaves no room for the notice, the notice
+		// degrades to best-effort (the stage must still never raise here).
+		const usable = charLen(text) + reserve <= budget ? budget - reserve : budget;
+		for (const part of optional) {
+			const size = charLen(chunkOf(part)) + 2;
+			if (charLen(text) + size <= usable) {
+				text = `${text}\n\n${chunkOf(part)}`;
+				continue;
+			}
+			dropped.push(part.name);
 		}
-		dropped.push(part.name);
 	}
 
 	if (dropped.length > 0) {
 		const notice = noticeOf(dropped);
-		// The notice is itself best-effort: never let it push the mission over budget.
+		// Never let the notice push the mission over budget.
 		if (charLen(text) + charLen(notice) + 2 <= budget) text = `${text}\n\n${notice}`;
 	}
 

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { resolveConfig } from "../src/config";
 import { parseChoice, parseEdits, ReplyParseError } from "../src/editor";
 import type { Surface } from "../src/surface";
@@ -6,12 +9,16 @@ import {
 	applyDelta,
 	diffSurface,
 	isAllowedPath,
+	readSurface,
+	renderContentReview,
 	renderFileMap,
 	renderScriptReview,
+	sameSurface,
 	surfaceFromJson,
 	surfaceHash,
 	surfaceToJson,
 	validate,
+	writeSurface,
 } from "../src/surface";
 
 const cfg = resolveConfig({ profile: "small" }, {} as NodeJS.ProcessEnv);
@@ -148,7 +155,10 @@ describe("diff / hash / render", () => {
 	});
 
 	test("surfaceHash is order-independent and content-sensitive", () => {
-		const shuffled: Surface = { ".pi/prompts/check.md": base[".pi/prompts/check.md"], "AGENTS.md": base["AGENTS.md"] };
+		const shuffled: Surface = {
+			".pi/prompts/check.md": base[".pi/prompts/check.md"] ?? "",
+			"AGENTS.md": base["AGENTS.md"] ?? "",
+		};
 		expect(surfaceHash(base)).toBe(surfaceHash(shuffled));
 		expect(surfaceHash(base)).not.toBe(surfaceHash({ ...base, "AGENTS.md": "other" }));
 	});
@@ -233,5 +243,50 @@ describe("reply parsing (the editor contract)", () => {
 		expect(parseChoice("c1", pool)).toBe("c1");
 		expect(parseChoice("```\nc2\n```", pool)).toBe("c2");
 		expect(() => parseChoice("c9", pool)).toThrow(/exactly one of c0, c1, c2/);
+	});
+});
+
+describe("writeSurface — prune safety, exec bits, review rendering", () => {
+	const WITH_FORBIDDEN = resolveConfig(
+		{ profile: "small", forbiddenGlobs: [".pi/prompts/**"] },
+		{} as NodeJS.ProcessEnv,
+	);
+
+	test("prune never deletes files the operator marked immutable", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "rsi-surface-"));
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "keep.md"), "# immutable\n");
+		writeFileSync(join(cwd, "AGENTS.md"), "# a\n");
+
+		const base = readSurface(cwd, WITH_FORBIDDEN);
+		expect(base[".pi/prompts/keep.md"]).toBeUndefined(); // readSurface honours the glob
+		writeSurface(cwd, base, { prune: true, base, cfg: WITH_FORBIDDEN });
+		expect(existsSync(join(cwd, ".pi", "prompts", "keep.md"))).toBe(true);
+	});
+
+	test("skill scripts are written executable (a 0644 helper is broken)", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "rsi-surface-"));
+		writeSurface(cwd, {
+			"AGENTS.md": "# a\n",
+			".pi/skills/x/SKILL.md": "---\nname: x\ndescription: d\n---\nbody\n",
+			".pi/skills/x/scripts/run.sh": "#!/bin/sh\necho hi\n",
+		});
+		expect(statSync(join(cwd, ".pi", "skills", "x", "scripts", "run.sh")).mode & 0o777).toBe(0o755);
+	});
+
+	test("renderContentReview shows the human-readable lines for always-on prose", () => {
+		const base: Surface = { "AGENTS.md": "# Rules\n- keep tests green\n" };
+		const cand: Surface = { "AGENTS.md": "# Rules\n- keep tests green\n- run typecheck first\n" };
+		const review = renderContentReview(base, cand);
+		expect(review).toContain("AGENTS.md");
+		expect(review).toContain("run typecheck first");
+		expect(renderContentReview(base, { ...base })).toBeFalsy();
+	});
+
+	test("sameSurface is canonical and ordering-independent", () => {
+		const a: Surface = { "AGENTS.md": "# a\n", ".pi/prompts/x.md": "# x\n" };
+		const b: Surface = { ".pi/prompts/x.md": "# x\n", "AGENTS.md": "# a\n" };
+		expect(sameSurface(a, b)).toBe(true);
+		expect(sameSurface(a, { ...a, "AGENTS.md": "# b\n" })).toBe(false);
 	});
 });

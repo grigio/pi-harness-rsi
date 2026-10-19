@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config";
 import { copyDir, exists, listFiles } from "../src/util";
-import { prepareSandbox } from "../src/worktree";
+import { cleanupSandboxes, prepareSandbox, runToken, runVerifier, sandboxId } from "../src/worktree";
 
 function freshCwd(): string {
 	return mkdtempSync(join(tmpdir(), "rsi-worktree-"));
@@ -54,5 +54,64 @@ describe("non-git sandbox (copy) is byte-faithful", () => {
 			sandbox.cleanup();
 		}
 		expect(exists(sandbox.path)).toBe(false);
+	});
+});
+
+describe("cleanupSandboxes protects live run sandboxes", () => {
+	test("a sandbox whose name carries the run token survives pruning", () => {
+		const cwd = freshCwd();
+		const root = join(cwd, cfg.worktreeRoot);
+		const mine = sandboxId("run-a", "final0");
+		const other = sandboxId("run-b", "final0");
+		mkdirSync(join(root, mine), { recursive: true });
+		mkdirSync(join(root, other), { recursive: true });
+		// Age both past the stale threshold.
+		const old = Date.now() - 60 * 60 * 1000;
+		utimesSync(join(root, mine), new Date(old), new Date(old));
+		utimesSync(join(root, other), new Date(old), new Date(old));
+
+		const result = cleanupSandboxes(cwd, cfg, { protect: ["run-a"], staleMs: 1000 });
+		expect(exists(join(root, mine))).toBe(true);
+		expect(exists(join(root, other))).toBe(false);
+		expect(result.dirs).toBe(1);
+
+		// Without protection both go.
+		mkdirSync(join(root, other), { recursive: true });
+		utimesSync(join(root, other), new Date(old), new Date(old));
+		cleanupSandboxes(cwd, cfg, { staleMs: 1000 });
+		expect(exists(join(root, mine))).toBe(false);
+	});
+
+	test("sandbox ids are unique per label within a run", () => {
+		expect(sandboxId("run-a", "final0")).not.toBe(sandboxId("run-a", "final1"));
+		expect(sandboxId("run-a", "final0")).not.toBe(sandboxId("run-b", "final0"));
+		expect(sandboxId("run-a", "final0").startsWith(`${runToken("run-a")}-`)).toBe(true);
+	});
+});
+
+describe("runVerifier is async and abortable (no event-loop freeze)", () => {
+	test("a passing verifier reports exit=0 with its tail", async () => {
+		const cwd = freshCwd();
+		const evidence = await runVerifier(cwd, { verifier: "echo all-good; exit 0", stageTimeoutMs: 10_000 });
+		expect(evidence?.exit).toBe(0);
+		expect(evidence?.line).toContain("exit=0");
+		expect(evidence?.line).toContain("all-good");
+	});
+
+	test("a failing verifier reports its exit code", async () => {
+		const cwd = freshCwd();
+		const evidence = await runVerifier(cwd, { verifier: "echo boom >&2; exit 3", stageTimeoutMs: 10_000 });
+		expect(evidence?.exit).toBe(3);
+		expect(evidence?.line).toContain("exit=3");
+	});
+
+	test("an aborted verifier is killed and reported as aborted", async () => {
+		const cwd = freshCwd();
+		const controller = new AbortController();
+		const promise = runVerifier(cwd, { verifier: "sleep 30", stageTimeoutMs: 30_000 }, controller.signal);
+		controller.abort();
+		const evidence = await promise;
+		expect(evidence?.line).toContain("aborted");
+		expect(evidence?.exit).toBeUndefined();
 	});
 });

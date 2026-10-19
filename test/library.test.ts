@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config";
-import { loadLessons, readExperience, readIndex, writeLessonIfValid } from "../src/library";
+import {
+	adoptSurface,
+	loadLessons,
+	readExperience,
+	readIndex,
+	revertSurface,
+	writeLessonIfValid,
+} from "../src/library";
 
 const cfg = resolveConfig({}, {} as NodeJS.ProcessEnv);
 
@@ -80,5 +87,57 @@ describe("library freshness + temporal supersession", () => {
 		const exp = readExperience(join(cwd, ".pi", "harness", "library", "demo", "stable"));
 		expect(exp?.superseded).toBeUndefined();
 		expect(exp?.lesson).toBe("v2");
+	});
+});
+
+describe("revertSurface: an explicit target must resolve", () => {
+	const adopt = (cwd: string, liveBefore: Record<string, string>) =>
+		adoptSurface(cwd, cfg, {
+			domain: "demo",
+			slug: "verifier-first",
+			liveBefore,
+			adopted: { "AGENTS.md": "# adopted\n" },
+		});
+
+	test("a typo'd slug reports the missing entry instead of restoring something else", () => {
+		const cwd = makeRepo();
+		adopt(cwd, { "AGENTS.md": "# before\n" });
+		const result = revertSurface(cwd, cfg, { domain: "demo", slug: "does-not-exist" });
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("no library entry demo/does-not-exist");
+	});
+
+	test("restores the previous surface when the entry exists", () => {
+		const cwd = makeRepo();
+		adopt(cwd, { "AGENTS.md": "# before\n" });
+		const result = revertSurface(cwd, cfg, { domain: "demo", slug: "verifier-first" });
+		expect(result.ok).toBe(true);
+		expect(result.restored).toContain("AGENTS.md");
+	});
+
+	test("an adoption onto an empty surface says so (nothing to restore)", () => {
+		const cwd = makeRepo();
+		adopt(cwd, {});
+		const result = revertSurface(cwd, cfg, { domain: "demo", slug: "verifier-first" });
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("adopted onto an empty surface");
+	});
+
+	test("a second adoption archives the outgoing previous/ into history/", () => {
+		const cwd = makeRepo();
+		adopt(cwd, { "AGENTS.md": "# before\n" });
+		// Second adoption: the state before *this* one is `# adopted`, which would
+		// overwrite the only copy of `# before` without the archive.
+		adoptSurface(cwd, cfg, {
+			domain: "demo",
+			slug: "verifier-first",
+			liveBefore: { "AGENTS.md": "# adopted\n" },
+			adopted: { "AGENTS.md": "# adopted again\n" },
+		});
+		const history = readdirSync(join(cwd, cfg.libraryDir, "demo", "verifier-first", "history"));
+		expect(history.length).toBe(1);
+		// `/rsi revert` still restores the most recent previous/, not the archive.
+		const result = revertSurface(cwd, cfg, { domain: "demo", slug: "verifier-first" });
+		expect(result.ok).toBe(true);
 	});
 });

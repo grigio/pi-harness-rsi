@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { resolveConfig } from "../src/config";
-import { finalAssistantText, parseChoice, parseEdits, parseExperience, ReplyParseError } from "../src/editor";
+import {
+	finalAssistantText,
+	parseChoice,
+	parseEdits,
+	parseExperience,
+	ReplyParseError,
+	sessionFailure,
+} from "../src/editor";
 
 const cfg = resolveConfig({ profile: "small" }, {} as NodeJS.ProcessEnv);
 
@@ -19,6 +26,13 @@ describe("editor.parseEdits — the fail-closed reply boundary", () => {
 		const reply = '<notes>n</notes>\n```json\n{"files":[{"path":".pi/prompts/p.md","op":"delete"}]}\n```';
 		const parsed = parseEdits(reply, cfg);
 		expect(parsed.delta.files).toEqual([{ path: ".pi/prompts/p.md", op: "delete" }]);
+	});
+
+	test("a closing fence on the last JSON line is still a fenced block", () => {
+		// Regression: requiring a newline before ``` made a valid reply fall back
+		// to the base surface, wasting the one retry and inflating kept_base.
+		const reply = '<notes>n</notes>\n```json\n{"files":[{"path":"AGENTS.md","op":"write","content":"# x"}]}```';
+		expect(parseEdits(reply, cfg).delta.files).toEqual([{ path: "AGENTS.md", op: "write", content: "# x" }]);
 	});
 
 	test("a reply with neither block is rejected with an actionable message", () => {
@@ -44,7 +58,7 @@ describe("editor.parseEdits — the fail-closed reply boundary", () => {
 			/without string content/,
 		);
 		const del = parseEdits('<edits>{"files":[{"path":".pi/prompts/x.md","op":"delete"}]}</edits>', cfg);
-		expect(del.delta.files[0].op).toBe("delete");
+		expect(del.delta.files[0]?.op).toBe("delete");
 	});
 
 	test("an unknown op is rejected", () => {
@@ -64,6 +78,10 @@ describe("editor.parseChoice — selector reply", () => {
 	test("accepts a fenced choice and a bare token", () => {
 		expect(parseChoice("```choice\nc2\n```", ["c0", "c1", "c2"])).toBe("c2");
 		expect(parseChoice("c0", ["c0", "c1"])).toBe("c0");
+	});
+
+	test("accepts a closing fence that shares its line with the id", () => {
+		expect(parseChoice("```choice\nc1```", ["c0", "c1"])).toBe("c1");
 	});
 
 	test("an out-of-pool id is rejected with the pool listed", () => {
@@ -126,5 +144,29 @@ describe("editor.finalAssistantText — last assistant message wins", () => {
 
 	test("an empty session yields the empty string", () => {
 		expect(finalAssistantText("")).toBe("");
+	});
+});
+
+describe("editor.sessionFailure — a provider error is not an unparsable reply", () => {
+	test("reports the provider's own message for an errored assistant turn", () => {
+		const line = JSON.stringify({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [],
+				stopReason: "error",
+				errorMessage: '429: {"type":"FreeUsageLimitError","message":"Rate limit exceeded."}',
+			},
+		});
+		expect(sessionFailure(`${line}\n`)).toContain("Rate limit exceeded");
+	});
+
+	test("is undefined for a normal empty/complete turn", () => {
+		const stopped = JSON.stringify({
+			type: "message",
+			message: { role: "assistant", content: [], stopReason: "stop" },
+		});
+		expect(sessionFailure(`${stopped}\n`)).toBeUndefined();
+		expect(sessionFailure("")).toBeUndefined();
 	});
 });

@@ -8,10 +8,11 @@
  * Reflection writes *nothing* when evidence is insufficient.
  */
 
+import { renameSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { type Surface, writeSurface } from "./surface";
-import { charLen, exists, listFiles, readTextIf, sanitizeSegment, slugify, writeText } from "./util";
+import { charLen, ensureDir, exists, listFiles, readTextIf, sanitizeSegment, slugify, writeText } from "./util";
 
 /** Fixed lesson caps (not profile-dependent — they are small on purpose). */
 export const LESSON_CAPS = { cue: 200, lesson: 600, evidence: 400 } as const;
@@ -151,7 +152,7 @@ export function listDomains(repoRoot: string, cfg: Pick<RsiConfig, "libraryDir">
 	try {
 		return listFiles(root)
 			.filter((rel) => rel.endsWith("/EXPERIENCE.md") || rel === "EXPERIENCE.md")
-			.map((rel) => rel.split("/")[0])
+			.map((rel) => rel.split("/")[0] as string)
 			.filter((d, i, arr) => arr.indexOf(d) === i)
 			.sort();
 	} catch {
@@ -167,7 +168,7 @@ export function listEntries(repoRoot: string, cfg: Pick<RsiConfig, "libraryDir">
 	try {
 		slugs = listFiles(dir)
 			.filter((rel) => rel.endsWith("/EXPERIENCE.md"))
-			.map((rel) => rel.split("/")[0]);
+			.map((rel) => rel.split("/")[0] as string);
 	} catch {
 		return [];
 	}
@@ -185,7 +186,7 @@ export function regenerateIndex(repoRoot: string, cfg: Pick<RsiConfig, "libraryD
 	const lines = [
 		`# ${sanitizeSegment(domain)} library`,
 		"",
-		`${entries.length} adopted entr${entries.length === 1 ? "y" : "ies"} — regenerate with /rsi-library`,
+		`${entries.length} adopted entr${entries.length === 1 ? "y" : "ies"} — regenerate with /rsi library`,
 		"",
 		...entries.map(
 			(e) =>
@@ -317,7 +318,7 @@ export interface AdoptionResult {
 
 /**
  * Snapshot the adopted surface into the library and keep the *previous* live
- * surface as `previous/` so `/rsi-revert` can restore it. Writes nothing until
+ * surface as `previous/` so `/rsi revert` can restore it. Writes nothing until
  * the human adoption gate has passed (P6).
  */
 export function adoptSurface(
@@ -329,8 +330,23 @@ export function adoptSurface(
 	const current = join(dir, "surface");
 	const previous = join(dir, "previous");
 
+	// Archive the outgoing `previous/` before it is overwritten: without this
+	// each adoption destroyed the one state `/rsi revert` needs beyond the last
+	// step, so a second adoption made the original surface unrecoverable except
+	// through git. `history/` is audit-only; `/rsi revert` still restores the
+	// most recent `previous/`.
+	if (exists(previous)) {
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		ensureDir(join(dir, "history"));
+		try {
+			renameSync(previous, join(dir, "history", stamp));
+		} catch {
+			// best-effort: a failed archive must not block the adoption itself
+		}
+	}
+
 	// `previous/` is always the live surface from before this adoption —
-	// that is what `/rsi-revert` restores.
+	// that is what `/rsi revert` restores.
 	writeSurface(previous, opts.liveBefore, { prune: true });
 	writeSurface(current, opts.adopted, { prune: true });
 	return { entryDir: dir, previousRestored: true };
@@ -354,35 +370,94 @@ export interface RevertResult {
 	message: string;
 }
 
+export interface RevertTarget {
+	domain: string;
+	slug: string;
+	snapshot: Surface;
+}
+
+export type RevertResolution = { ok: true; target: RevertTarget } | { ok: false; message: string };
+
+/**
+ * Resolve *which* library entry `/rsi revert` means, without touching the live
+ * tree. Split out from `revertSurface` so the command layer can apply the
+ * snapshot inside the same guarded transaction as adoption (dirty check, run
+ * lock, rollback) instead of writing straight to the tree.
+ *
+ * With no slug, the most recently adopted entry in `domain` (or the whole
+ * library when `domain` is omitted) is used. An explicit target must resolve or
+ * fail loudly: silently reverting some other entry is the kind of surprise a
+ * restore command must never spring.
+ */
+export function resolveRevertTarget(
+	repoRoot: string,
+	cfg: Pick<RsiConfig, "libraryDir">,
+	opts: { domain?: string; slug?: string },
+): RevertResolution {
+	const domains = opts.domain ? [sanitizeSegment(opts.domain)] : listDomains(repoRoot, cfg);
+	const explicit = opts.slug !== undefined;
+	const emptyTargets: string[] = [];
+	for (const domain of [...domains].reverse()) {
+		const entries = listEntries(repoRoot, cfg, domain);
+		const slugs = opts.slug ? [slugify(opts.slug)] : entries.map((e) => e.slug).reverse();
+		for (const slug of slugs) {
+			const dir = entryDir(repoRoot, cfg, domain, slug);
+			// An explicit slug with no entry directory is a typo, not an empty
+			// snapshot: report it as such instead of restoring something else.
+			if (opts.slug && !exists(dir)) continue;
+			const snapshot = surfaceFromDir(join(dir, "previous"));
+			if (Object.keys(snapshot).length === 0) {
+				emptyTargets.push(`${domain}/${slug}`);
+				continue;
+			}
+			return { ok: true, target: { domain, slug, snapshot } };
+		}
+		if (explicit) break;
+	}
+	if (emptyTargets.length > 0) {
+		// The first adoption onto a tree with no surface at all snapshots an
+		// empty `previous/` — there is nothing to restore, and saying so is
+		// more useful than "not found".
+		return {
+			ok: false,
+			message:
+				`${emptyTargets.join(", ")} was adopted onto an empty surface, so there is no previous ` +
+				`state to restore — use git to undo that first adoption`,
+		};
+	}
+	if (explicit && opts.domain) {
+		return {
+			ok: false,
+			message: `no library entry ${opts.domain}/${opts.slug} — /rsi library ${opts.domain} lists what exists`,
+		};
+	}
+	return { ok: false, message: "no previous surface snapshot found in the library" };
+}
+
 /**
  * Restore a previously adopted surface into the live tree.
- * With no slug, the most recently adopted entry in `domain` (or the whole
- * library when `domain` is omitted) is used.
+ *
+ * Low-level primitive (no dirty-tree check, no lock): the `/rsi revert`
+ * command must go through the guarded transaction in `loop.revertAdopted`, which
+ * uses `resolveRevertTarget` directly. Kept for tests and for callers that
+ * already hold those guards.
  */
 export function revertSurface(
 	repoRoot: string,
 	cfg: Pick<RsiConfig, "libraryDir">,
 	opts: { domain?: string; slug?: string },
 ): RevertResult {
-	const domains = opts.domain ? [sanitizeSegment(opts.domain)] : listDomains(repoRoot, cfg);
-	for (const domain of [...domains].reverse()) {
-		const entries = listEntries(repoRoot, cfg, domain);
-		const slugs = opts.slug ? [slugify(opts.slug)] : entries.map((e) => e.slug).reverse();
-		for (const slug of slugs) {
-			const previousDir = join(entryDir(repoRoot, cfg, domain, slug), "previous");
-			const snapshot = surfaceFromDir(previousDir);
-			if (Object.keys(snapshot).length === 0) continue;
-			writeSurface(repoRoot, snapshot, { prune: true });
-			return {
-				ok: true,
-				domain,
-				slug,
-				restored: Object.keys(snapshot).sort().join(", "),
-				message: `restored previous surface for ${domain}/${slug}`,
-			};
-		}
-	}
-	return { ok: false, restored: "", message: "no previous surface snapshot found in the library" };
+	const resolved = resolveRevertTarget(repoRoot, cfg, opts);
+	if (!resolved.ok) return { ok: false, restored: "", message: resolved.message };
+	const { domain, slug, snapshot } = resolved.target;
+	writeSurface(repoRoot, snapshot, { prune: true });
+	return {
+		ok: true,
+		domain,
+		slug,
+		restored: Object.keys(snapshot).sort().join(", "),
+		message: `restored previous surface for ${domain}/${slug}`,
+	};
 }
 
 /** Write the loop's EXPERIENCE.md only when validation passes (else write nothing). */

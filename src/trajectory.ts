@@ -9,7 +9,7 @@
  * sections are dropped lowest-priority-first instead of being sliced mid-line.
  */
 
-import { charLen, truncateEnd, truncateMiddle } from "./util";
+import { charLen, hash12, truncateEnd, truncateMiddle } from "./util";
 
 export interface SessionMessage {
 	role: string;
@@ -57,12 +57,21 @@ function textOf(message: SessionMessage | undefined): string {
 }
 
 /** `toolCall` blocks of an assistant message, normalized for pairing. */
-function toolCallsOf(message: SessionMessage | undefined): Array<{ id?: string; toolName: string; call: string }> {
+function toolCallsOf(
+	message: SessionMessage | undefined,
+): Array<{ id?: string; toolName: string; call: string; brief: string }> {
 	const content = message?.content;
 	if (!Array.isArray(content)) return [];
 	return content
 		.filter((b) => b && b.type === "toolCall" && typeof b.name === "string")
-		.map((b) => ({ id: b.id, toolName: b.name as string, call: briefOf(b.arguments) }));
+		.map((b) => ({
+			id: b.id,
+			toolName: b.name as string,
+			// Rework identity: the payload counts for edit/write (see callIdentity).
+			call: callIdentity(b.name as string, b.arguments),
+			// Human-readable window for the digest: never a JSON blob.
+			brief: briefOf(b.arguments),
+		}));
 }
 
 /**
@@ -74,7 +83,7 @@ function toolCallsOf(message: SessionMessage | undefined): Array<{ id?: string; 
 export function summarizeSession(jsonl: string): SessionSummary {
 	const models = new Set<string>();
 	const steps: SessionSummary["steps"] = [];
-	const pending = new Map<string, { tool: string; call: string }>();
+	const pending = new Map<string, { tool: string; call: string; brief: string }>();
 	let turns = 0;
 	let usd = 0;
 	let totalTokens = 0;
@@ -101,7 +110,7 @@ export function summarizeSession(jsonl: string): SessionSummary {
 			turns++;
 			if (typeof m.model === "string" && m.model.length > 0) models.add(m.model);
 			for (const call of toolCallsOf(m)) {
-				if (call.id) pending.set(call.id, { tool: call.toolName, call: call.call });
+				if (call.id) pending.set(call.id, { tool: call.toolName, call: call.call, brief: call.brief });
 			}
 			continue;
 		}
@@ -116,7 +125,8 @@ export function summarizeSession(jsonl: string): SessionSummary {
 				tool: m.toolName ?? awaited?.tool ?? "unknown",
 				call: awaited?.call ?? "",
 				isError: m.isError === true || (exit !== undefined && exit !== 0),
-				brief: raw,
+				// The call's arguments are the useful window when the result is noise.
+				brief: raw.trim().length > 0 ? raw : (awaited?.brief ?? ""),
 				exit,
 			});
 		}
@@ -221,7 +231,8 @@ export function digest(input: DigestInput): DigestResult {
 	// first divergence: first error, else first repeated no-op, else none
 	let divergence = "first_divergence: none";
 	if (errorSteps.length > 0) {
-		divergence = `first_divergence: @step=${errorSteps[0].index} hypothesis: ${errorSteps[0].tool} failed first — the rest of the run reacts to it`;
+		const firstError = errorSteps[0] as (typeof errorSteps)[number];
+		divergence = `first_divergence: @step=${firstError.index} hypothesis: ${firstError.tool} failed first — the rest of the run reacts to it`;
 	} else {
 		const repeat = longestDuplicateRun(summary.steps);
 		if (repeat) {
@@ -302,11 +313,12 @@ function longestDuplicateRun(steps: SessionSummary["steps"]): DuplicateRun | und
 		const cur = steps[i];
 		const hasKey = (s: SessionSummary["steps"][number] | undefined): boolean =>
 			s !== undefined && (s.call?.length ?? 0) > 0;
-		const same = cur !== undefined && hasKey(prev) && hasKey(cur) && key(prev) === key(cur);
+		const same =
+			cur !== undefined && hasKey(prev) && hasKey(cur) && key(prev as SessionSummary["steps"][number]) === key(cur);
 		if (same) continue;
 		const length = i - runStart;
 		if (length >= 2 && (!best || length > best.length)) {
-			best = { tool: steps[runStart].tool, length, start: runStart };
+			best = { tool: (steps[runStart] as SessionSummary["steps"][number]).tool, length, start: runStart };
 		}
 		runStart = i;
 	}
@@ -355,4 +367,33 @@ function briefOf(args: unknown): string {
 	const a = args as Record<string, unknown>;
 	const key = typeof a.command === "string" ? a.command : typeof a.path === "string" ? a.path : JSON.stringify(a);
 	return String(key).slice(0, 200);
+}
+
+/**
+ * Identity of a tool call for rework detection.
+ *
+ * Keying `edit` on `arguments.path` alone made three *different* edits to the
+ * same file look like "3 consecutive identical edit calls" — a fabricated
+ * rework signal, and the digest is exactly the artifact the loop optimizes
+ * against. For edit/write the payload is part of the identity; reads keep
+ * path-only identity (re-reading one path really is the rework pattern).
+ */
+function callIdentity(tool: string, args: unknown): string {
+	if (!args || typeof args !== "object") return briefOf(args);
+	const a = args as Record<string, unknown>;
+	const path = typeof a.path === "string" ? a.path : "";
+	if (tool === "edit") {
+		const edits = a.edits ?? a.oldString ?? a.newString ?? "";
+		return `${path}\u0000${stableStringify(edits)}`;
+	}
+	if (tool === "write") return `${path}\u0000${hash12(typeof a.content === "string" ? a.content : "")}`;
+	return briefOf(args);
+}
+
+/** JSON with sorted keys, so argument order cannot change an identity. */
+function stableStringify(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? String(value);
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }

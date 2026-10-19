@@ -14,7 +14,6 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
-	statSync,
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
@@ -24,7 +23,27 @@ export function charLen(s: string): number {
 	return [...s].length;
 }
 
-/** First 12 hex chars of sha256 — stable short identity for strings/surfaces. */
+/**
+ * Validate a *single* path segment that comes from user input (a run id or a
+ * surface label) before it is joined into a filesystem path.
+ *
+ * `join(runDir, "surfaces", `${label}.json`)` with a label of
+ * `../../../../evil` resolves outside the run directory, so an unvalidated
+ * `/rsi adopt <label>` could read — and adopt — any JSON file on disk. Returns
+ * an error string, or undefined when the segment is safe.
+ */
+export function segmentError(value: string, what = "segment"): string | undefined {
+	if (value.length === 0) return `${what} is empty`;
+	if (value.length > 128) return `${what} is too long (${value.length} chars, max 128)`;
+	if (value.includes("/") || value.includes("\\")) return `${what} must not contain a path separator: "${value}"`;
+	if (value.includes("\u0000")) return `${what} contains a NUL byte`;
+	if (value === "." || value === ".." || value.includes("..")) return `${what} must not contain "..": "${value}"`;
+	if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+		return `${what} may only contain letters, digits, dot, underscore and hyphen: "${value}"`;
+	}
+	return undefined;
+}
+
 export function hash12(s: string): string {
 	return createHash("sha256").update(s).digest("hex").slice(0, 12);
 }
@@ -199,7 +218,9 @@ export function seededShuffle<T>(items: readonly T[], seed: number): T[] {
 	const out = [...items];
 	for (let i = out.length - 1; i > 0; i--) {
 		const j = Math.floor(rnd() * (i + 1));
-		[out[i], out[j]] = [out[j], out[i]];
+		const tmp = out[i];
+		out[i] = out[j] as T;
+		out[j] = tmp as T;
 	}
 	return out;
 }
@@ -232,10 +253,10 @@ export function globToRegExp(glob: string): RegExp {
 	if (cached) return cached;
 	let out = "";
 	for (let i = 0; i < glob.length; i++) {
-		const c = glob[i];
+		const c = glob.charAt(i);
 		if (c === "*") {
-			if (glob[i + 1] === "*") {
-				if (glob[i + 2] === "/") {
+			if (glob.charAt(i + 1) === "*") {
+				if (glob.charAt(i + 2) === "/") {
 					out += "(?:[^/]+/)*";
 					i += 2;
 				} else {
@@ -276,26 +297,27 @@ export function extractTag(text: string, tag: string): string | undefined {
 	const re = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>`, "g");
 	const matches = [...text.matchAll(re)];
 	if (matches.length === 0) return undefined;
-	const whole = matches[matches.length - 1][0];
+	const whole = matches[matches.length - 1]?.[0] ?? "";
 	return whole.slice(tag.length + 2, -(tag.length + 3)).trim();
 }
 
 /** Strip an optional ```/```json fence from an inline payload. */
 export function stripFence(s: string): string {
 	const trimmed = s.trim();
-	const m = trimmed.match(/^```(?:json|js|javascript|ts|typescript)?\n([\s\S]*?)\n```$/);
-	return (m ? m[1] : trimmed).trim();
+	// Tolerant of a closing fence that shares its line with the last token.
+	const m = trimmed.match(/^```(?:json|js|javascript|ts|typescript)?[ \t]*\r?\n?([\s\S]*?)\r?\n?[ \t]*```$/);
+	return (m ? (m[1] ?? "") : trimmed).trim();
 }
 
-export function fileSize(path: string): number {
-	try {
-		return statSync(path).size;
-	} catch {
-		return 0;
-	}
-}
-
-/** Run `fn` over `items` with at most `limit` in flight (maxParallel). */
+/**
+ * Run `fn` over `items` with at most `limit` in flight (maxParallel).
+ *
+ * Failure is fail-fast *and* fail-quiet: the first rejection stops the workers
+ * from picking up new items (previously they kept draining the queue, so a
+ * `/rsi stop` rejection left children burning budget with nobody awaiting
+ * them), and in-flight promises are awaited before the error propagates so no
+ * sandbox is cleaned up from under a live child.
+ */
 export async function mapLimit<T, R>(
 	items: readonly T[],
 	limit: number,
@@ -303,13 +325,21 @@ export async function mapLimit<T, R>(
 ): Promise<R[]> {
 	const results: R[] = new Array(items.length);
 	let next = 0;
+	let failure: unknown;
 	const workers = new Array(Math.max(1, Math.min(limit, items.length))).fill(0).map(async () => {
 		for (;;) {
+			if (failure !== undefined) return;
 			const i = next++;
 			if (i >= items.length) return;
-			results[i] = await fn(items[i], i);
+			try {
+				results[i] = await fn(items[i] as T, i);
+			} catch (err) {
+				if (failure === undefined) failure = err;
+				return;
+			}
 		}
 	});
 	await Promise.all(workers);
+	if (failure !== undefined) throw failure;
 	return results;
 }

@@ -149,3 +149,62 @@ describe("session discovery for evidence", () => {
 		expect(sessionUsd(fake)).toBeGreaterThan(0);
 	});
 });
+
+describe("digest rework — edits are identified by their payload, not just the path", () => {
+	function editSession(edits: unknown[]): string {
+		const entries: unknown[] = [{ type: "session", version: 3, id: "s" }];
+		edits.forEach((payload, i) => {
+			const id = `e${i}`;
+			entries.push({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id, name: "edit", arguments: { path: "src/a.ts", edits: payload } }],
+				},
+			});
+			entries.push({
+				type: "message",
+				message: { role: "toolResult", toolCallId: id, toolName: "edit", content: "ok" },
+			});
+		});
+		return jsonl(entries);
+	}
+
+	test("three different edits to the same file are not fabricated rework", () => {
+		const out = digest({
+			label: "c0",
+			sessionJsonl: editSession([
+				{ old: "a", new: "b" },
+				{ old: "c", new: "d" },
+				{ old: "e", new: "f" },
+			]),
+			cap: 6_000,
+		});
+		expect(out.text).toContain("rework: none");
+	});
+
+	test("three identical edits are real rework", () => {
+		const same = { old: "a", new: "b" };
+		const out = digest({ label: "c1", sessionJsonl: editSession([same, same, same]), cap: 6_000 });
+		expect(out.text).toContain("rework: 3 consecutive identical edit calls");
+	});
+
+	test("re-reading one path is still rework (path-only identity for reads)", () => {
+		const entries: unknown[] = [{ type: "session", version: 3, id: "s" }];
+		for (let i = 0; i < 3; i++) {
+			entries.push({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: `r${i}`, name: "read", arguments: { path: "src/a.ts" } }],
+				},
+			});
+			entries.push({
+				type: "message",
+				message: { role: "toolResult", toolCallId: `r${i}`, toolName: "read", content: "ok" },
+			});
+		}
+		const out = digest({ label: "c2", sessionJsonl: jsonl(entries), cap: 6_000 });
+		expect(out.text).toContain("rework: 3 consecutive identical read calls");
+	});
+});

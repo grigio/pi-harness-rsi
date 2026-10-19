@@ -1,5 +1,5 @@
 /**
- * Regression for the `/rsi-stop` candidate-probe bug: reference and final
+ * Regression for the `/rsi stop` candidate-probe bug: reference and final
  * probes were wired to `ctx.signal`, but candidate probes were wired to the
  * *external* `LoopOptions.signal` (usually undefined), so a stop during the
  * candidate stage only took effect at the next stage boundary — up to
@@ -7,7 +7,7 @@
  *
  * The child `pi` here is a stub script: solver reference runs finish instantly,
  * editor runs return an empty delta, and candidate runs sleep. With the fix a
- * `/rsi-stop` (abort of `ctx.signal`) kills the sleeping candidate child
+ * `/rsi stop` (abort of `ctx.signal`) kills the sleeping candidate child
  * promptly; without it, the run hangs until the stage timeout.
  */
 
@@ -47,7 +47,7 @@ function writeStub(): string {
 	return bin;
 }
 
-describe("/rsi-stop during candidate probes (regression)", () => {
+describe("/rsi stop during candidate probes (regression)", () => {
 	test("aborts the sleeping candidate child promptly instead of waiting for the stage timeout", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "rsi-stop-"));
 		writeFileSync(join(cwd, "README.md"), "# demo\n");

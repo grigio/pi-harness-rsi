@@ -8,6 +8,7 @@ import {
 	matchGlob,
 	sanitizeSegment,
 	seededShuffle,
+	segmentError,
 	slugify,
 	truncateEnd,
 	truncateMiddle,
@@ -126,5 +127,44 @@ describe("util determinism — seeded shuffle + jaccard", () => {
 		expect(jaccardLines("a", "b")).toBe(0);
 		expect(jaccardLines("", "")).toBe(1);
 		expect(jaccardLines("a\nb", "b\nc")).toBeCloseTo(1 / 3, 5);
+	});
+});
+
+describe("util.segmentError — user-supplied path segments", () => {
+	test("rejects traversal, separators, empties and overlong values", () => {
+		expect(segmentError("final0")).toBeUndefined();
+		expect(segmentError("a.b_c-d")).toBeUndefined();
+		expect(segmentError("../../evil")).toContain("path separator");
+		expect(segmentError("a/b")).toContain("path separator");
+		expect(segmentError("a\\b")).toContain("path separator");
+		expect(segmentError("..")).toContain("..");
+		expect(segmentError("a..b")).toContain("..");
+		expect(segmentError("")).toContain("empty");
+		expect(segmentError("x".repeat(129))).toContain("too long");
+		expect(segmentError("has space")).toContain("may only contain");
+	});
+});
+
+describe("util.mapLimit — fail fast and quiet", () => {
+	test("stops scheduling after the first failure and rejects others with the cause", async () => {
+		let started = 0;
+		let running = 0;
+		let peakRunning = 0;
+		const err = await mapLimit([1, 2, 3, 4, 5, 6], 2, async (n) => {
+			started++;
+			running++;
+			peakRunning = Math.max(peakRunning, running);
+			if (n === 2) {
+				running--;
+				throw new Error("boom");
+			}
+			await new Promise((r) => setTimeout(r, 20));
+			running--;
+			return n;
+		}).catch((e: Error) => e);
+		expect((err as Error).message).toBe("boom");
+		// only the first batch ever started; no runaway siblings
+		expect(started).toBe(2);
+		expect(peakRunning).toBeLessThanOrEqual(2);
 	});
 });

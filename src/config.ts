@@ -30,7 +30,7 @@ export interface Budgets {
 	/**
 	 * Select mission, fully assembled. Not capped by any per-artifact table (the
 	 * table only caps per-deliverable excerpts) but `assemble()` needs a declared
-	 * budget for the stage too — declared here and shown in `/rsi-status`.
+	 * budget for the stage too — declared here and shown in `/rsi status`.
 	 */
 	selectMission: number;
 	/** `<notes>` / `<why>` decision notes per stage. */
@@ -136,6 +136,19 @@ export interface RsiConfig {
 const POSITIVE_INT = (n: unknown, fallback: number): number =>
 	typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 
+/**
+ * Money and other fractional quantities. `POSITIVE_INT` floors, which silently
+ * turned `maxUsd: 0.5` into 0 — and `spent >= 0` aborts the run before its first
+ * stage. Values below the floor are rejected back to the default instead.
+ */
+const POSITIVE_FLOAT = (n: unknown, fallback: number, min: number): number =>
+	typeof n === "number" && Number.isFinite(n) && n >= min ? n : fallback;
+
+/** Smallest budget worth honouring: a run that cannot spend a cent is a misconfiguration. */
+export const MIN_USD = 0.01;
+/** A profile override of 0 chars would make every stage fail; 1 char is honoured. */
+const MIN_BUDGET_CHARS = 1;
+
 /** Upper bounds that keep a typo (`--k 100`) from spawning 400 rollouts. */
 export const MAX_K = 8;
 export const MAX_PARALLEL = 8;
@@ -154,13 +167,15 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env
 	const budgets: Budgets = { ...PROFILES[profile] };
 	if (s.budgets && typeof s.budgets === "object") {
 		for (const [key, value] of Object.entries(s.budgets as Record<string, unknown>)) {
-			if (key in budgets && typeof value === "number" && Number.isFinite(value) && value > 0) {
+			if (key in budgets && typeof value === "number" && Number.isFinite(value) && value >= MIN_BUDGET_CHARS) {
 				budgets[key as keyof Budgets] = Math.floor(value);
 			}
 		}
 	}
 
 	const envMaxUsd = env.PI_RSI_MAX_USD !== undefined ? Number(env.PI_RSI_MAX_USD) : undefined;
+	// The env override is an explicit operator escape hatch: any positive value is
+	// honoured (tests pin a near-zero budget to prove the fail-closed stop).
 	const envMaxUsdOk = envMaxUsd !== undefined && Number.isFinite(envMaxUsd) && envMaxUsd > 0;
 	const fakeRaw = (env.PI_RSI_FAKE ?? "").trim();
 	const fake = fakeRaw === "1" || fakeRaw.toLowerCase() === "true";
@@ -174,7 +189,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env
 		thinking: typeof s.thinking === "string" && s.thinking.length > 0 ? s.thinking : null,
 		verifier: typeof s.verifier === "string" && s.verifier.trim().length > 0 ? s.verifier.trim() : null,
 		confirmAdopt: s.confirmAdopt !== false,
-		maxUsd: envMaxUsdOk ? (envMaxUsd as number) : POSITIVE_INT(s.maxUsd, 2),
+		maxUsd: envMaxUsdOk ? (envMaxUsd as number) : POSITIVE_FLOAT(s.maxUsd, 2, MIN_USD),
 		maxParallel: clampParallel(POSITIVE_INT(s.maxParallel, 2)),
 		libraryDir: typeof s.libraryDir === "string" && s.libraryDir ? s.libraryDir : ".pi/harness/library",
 		worktreeRoot: typeof s.worktreeRoot === "string" && s.worktreeRoot ? s.worktreeRoot : ".pi/harness/worktrees",
@@ -185,7 +200,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env
 		budgets,
 		requireClean: s.requireClean !== false,
 		stageTimeoutMs: POSITIVE_INT(s.stageTimeoutMs, 600_000),
-		keepRuns: POSITIVE_INT(s.keepRuns, 20),
+		keepRuns: POSITIVE_FLOAT(s.keepRuns, 20, 1),
 		fake,
 		fakeScenario:
 			env.PI_RSI_FAKE_SCENARIO === "invalid-first"

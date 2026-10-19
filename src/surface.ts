@@ -9,22 +9,11 @@
  * so they are written as instructions, not as stack traces.
  */
 
-import { readFileSync, rmSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { forbiddenError, forbiddenMatch, scanScriptBody, scanTripwire, scriptScanError, tripwireError } from "./guard";
-import {
-	charLen,
-	ensureDir,
-	exists,
-	globToRegExp,
-	hash12,
-	listFiles,
-	readTextIf,
-	toPosix,
-	truncateEnd,
-	writeText,
-} from "./util";
+import { charLen, ensureDir, exists, hash12, listFiles, readTextIf, toPosix, truncateEnd, writeText } from "./util";
 
 /** posix-relative surface path → file content. */
 export type Surface = Record<string, string>;
@@ -58,6 +47,23 @@ export interface ValidationReport {
 	warnings: string[];
 }
 
+/**
+ * A validation finding with a *stable identity*.
+ *
+ * `key` is what delta-only validation diffs on — it must never embed a value
+ * that changes between the base and the candidate (a char count, a length, a
+ * marker). Diffing on the message text was the bug that let a pre-existing
+ * over-budget `AGENTS.md` block every proposal: `7044 chars` and `7013 chars`
+ * are different strings, so the inherited error looked newly introduced.
+ */
+export interface Issue {
+	key: string;
+	message: string;
+}
+
+/** Paths under `.pi/skills/<name>/scripts/` are executable capability. */
+const EXEC_BIT_MODE = 0o755;
+
 /** Prefixes that may ever appear in a delta. Everything else is off-surface. */
 const RE_PROMPT = /^\.pi\/prompts\/[^/]+\.md$/;
 const RE_SKILL_MD = /^\.pi\/skills\/([^/]+)\/SKILL\.md$/;
@@ -84,9 +90,9 @@ export function isAllowedPath(path: string): string | undefined {
 	if (p === "AGENTS.md") return undefined;
 	if (RE_PROMPT.test(p)) return undefined;
 	const skillMd = p.match(RE_SKILL_MD);
-	if (skillMd) return checkSkillName(skillMd[1], p);
+	if (skillMd) return checkSkillName(skillMd[1] ?? "", p);
 	const skillScript = p.match(RE_SKILL_SCRIPT);
-	if (skillScript) return checkSkillName(skillScript[1], p);
+	if (skillScript) return checkSkillName(skillScript[1] ?? "", p);
 	return (
 		`off-surface path "${path}" — allowed: AGENTS.md, .pi/prompts/<name>.md, ` +
 		`.pi/skills/<name>/SKILL.md, .pi/skills/<name>/scripts/**`
@@ -129,12 +135,31 @@ export function readSurface(root: string, cfg?: Pick<RsiConfig, "forbiddenGlobs"
 	return surface;
 }
 
-/** Write a surface into a tree. `prune` removes previously-surface files that are absent now. */
-export function writeSurface(root: string, surface: Surface, opts: { prune?: boolean } = {}): void {
+/**
+ * Write a surface into a tree.
+ *
+ * `prune` removes surface files that are absent from `surface` — but only files
+ * that were part of the *base* surface. Pruning from a fresh directory listing
+ * was a data-loss bug: paths excluded by `rsi.forbiddenGlobs` (documented as
+ * immutable) are still `isAllowedPath`-legal, so they were deleted on adoption.
+ * When `base` is omitted, `cfg.forbiddenGlobs` is honoured instead.
+ *
+ * Skill scripts are made executable on write: they are mounted into every probe
+ * sandbox as executable capability, and a 0644 script is a broken helper.
+ */
+export function writeSurface(
+	root: string,
+	surface: Surface,
+	opts: { prune?: boolean; base?: Surface; cfg?: Pick<RsiConfig, "forbiddenGlobs"> } = {},
+): void {
 	if (opts.prune) {
-		const existing = listFiles(root, { excludeDirs: [".git", "node_modules", ".pi/harness"] });
+		const existing = opts.base
+			? Object.keys(opts.base)
+			: listFiles(root, { excludeDirs: [".git", "node_modules", ".pi/harness"] });
 		for (const rel of existing) {
 			if (isAllowedPath(rel) !== undefined) continue;
+			// Never delete something the operator marked immutable.
+			if (opts.cfg && forbiddenMatch(rel, opts.cfg) !== undefined) continue;
 			if (rel in surface) continue;
 			try {
 				rmSync(join(root, rel), { force: true });
@@ -144,7 +169,15 @@ export function writeSurface(root: string, surface: Surface, opts: { prune?: boo
 		}
 	}
 	for (const [path, content] of Object.entries(surface)) {
-		writeText(join(root, path), content);
+		const abs = join(root, path);
+		writeText(abs, content);
+		if (RE_SKILL_SCRIPT.test(path)) {
+			try {
+				chmodSync(abs, EXEC_BIT_MODE);
+			} catch {
+				// best-effort: a filesystem without chmod support must not fail adoption
+			}
+		}
 	}
 	ensureDir(root);
 }
@@ -208,7 +241,7 @@ export function parseFrontmatter(text: string): FrontmatterReport {
 		return { ok: false, body: text, errors: ["missing YAML frontmatter (`---` … `---`) at top of SKILL.md"] };
 	}
 	const fields: Record<string, string> = {};
-	for (const line of m[1].split("\n")) {
+	for (const line of (m[1] ?? "").split("\n")) {
 		const idx = line.indexOf(":");
 		if (idx === -1) continue;
 		const key = line.slice(0, idx).trim();
@@ -244,36 +277,44 @@ export function validate(
 	opts: { where?: string; base?: Surface } = {},
 ): ValidationReport {
 	const direct = validateSurface(surface, cfg, opts.where);
-	if (!opts.base) return direct;
-	const baseReport = validateSurface(opts.base, cfg, opts.where);
-	const baseErrors = new Set(baseReport.errors);
-	const baseWarnings = new Set(baseReport.warnings);
+	if (!opts.base)
+		return { errors: direct.errors.map((e) => e.message), warnings: direct.warnings.map((w) => w.message) };
+	// Diff on `key`, never on the rendered message: an inherited issue whose
+	// message embeds a value ("7044 chars") must stay inherited.
+	const baseErrors = new Set(validateSurface(opts.base, cfg, opts.where).errors.map((e) => e.key));
+	const baseWarnings = new Set(validateSurface(opts.base, cfg, opts.where).warnings.map((w) => w.key));
 	return {
-		errors: direct.errors.filter((e) => !baseErrors.has(e)),
-		warnings: direct.warnings.filter((w) => !baseWarnings.has(w)),
+		errors: direct.errors.filter((e) => !baseErrors.has(e.key)).map((e) => e.message),
+		warnings: direct.warnings.filter((w) => !baseWarnings.has(w.key)).map((w) => w.message),
 	};
 }
 
-function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): ValidationReport {
-	const errors: string[] = [];
-	const warnings: string[] = [];
+function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): { errors: Issue[]; warnings: Issue[] } {
+	const errors: Issue[] = [];
+	const warnings: Issue[] = [];
 	const where = whereOpt ? `${whereOpt}: ` : "";
 	const budgets = cfg.budgets;
+	const err = (key: string, message: string): void => {
+		errors.push({ key, message });
+	};
+	const warn = (key: string, message: string): void => {
+		warnings.push({ key, message });
+	};
 
 	// 1. Path whitelist (delta paths are surface paths, so this covers every key).
 	for (const path of Object.keys(surface)) {
 		const pathError = isAllowedPath(path);
 		if (pathError) {
-			errors.push(where + pathError);
+			err(`path:${path}`, where + pathError);
 			continue;
 		}
 		const forbidden = forbiddenMatch(path, cfg);
-		if (forbidden) errors.push(where + forbiddenError(path, forbidden));
+		if (forbidden) err(`forbidden:${path}`, where + forbiddenError(path, forbidden));
 		const marker = scanTripwire(path, surface[path] ?? "");
-		if (marker) errors.push(where + tripwireError(path, marker));
+		if (marker) err(`tripwire:${path}:${marker}`, where + tripwireError(path, marker));
 		if (RE_SKILL_SCRIPT.test(path)) {
 			for (const id of scanScriptBody(path, surface[path] ?? "")) {
-				errors.push(where + scriptScanError(path, id));
+				err(`script:${path}:${id}`, where + scriptScanError(path, id));
 			}
 		}
 	}
@@ -281,9 +322,10 @@ function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): V
 	// 2. Always-on file.
 	const agents = surface["AGENTS.md"];
 	if (typeof agents !== "string") {
-		errors.push(`${where}AGENTS.md is missing — the always-on file must always be present`);
+		err("agents-missing", `${where}AGENTS.md is missing — the always-on file must always be present`);
 	} else if (charLen(agents) > budgets.agentsMd) {
-		errors.push(
+		err(
+			"agents-over-budget",
 			`${where}AGENTS.md is ${charLen(agents)} chars, over the ${budgets.agentsMd} budget (profile ${cfg.profile}) — cut it down to fit`,
 		);
 	}
@@ -300,30 +342,41 @@ function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): V
 		const skillMdPath = `.pi/skills/${dir}/SKILL.md`;
 		const content = surface[skillMdPath];
 		if (typeof content !== "string") {
-			errors.push(`${where}.pi/skills/${dir}/ has no SKILL.md — ship the skill file or drop the directory`);
+			err(
+				`skill-missing-md:${dir}`,
+				`${where}.pi/skills/${dir}/ has no SKILL.md — ship the skill file or drop the directory`,
+			);
 			continue;
 		}
 
 		const fm = parseFrontmatter(content);
-		for (const e of fm.errors) errors.push(`${where}${skillMdPath}: ${e}`);
+		for (const e of fm.errors) err(`skill-frontmatter:${skillMdPath}:${e}`, `${where}${skillMdPath}: ${e}`);
 		if (fm.name && fm.name !== dir) {
-			errors.push(`${where}${skillMdPath}: frontmatter name "${fm.name}" must match directory "${dir}"`);
+			err(
+				`skill-name-mismatch:${skillMdPath}`,
+				`${where}${skillMdPath}: frontmatter name "${fm.name}" must match directory "${dir}"`,
+			);
 		}
 		if (typeof fm.description === "string" && fm.description.length > 0) {
 			if (charLen(fm.description) > budgets.skillDescription) {
-				errors.push(
+				err(
+					`skill-description-budget:${skillMdPath}`,
 					`${where}${skillMdPath}: description is ${charLen(fm.description)} chars, over the ${budgets.skillDescription} budget — shorten it`,
 				);
 			}
 		}
 		const body = fm.body ?? "";
 		if (charLen(body) > budgets.skillBodyWarn) {
-			warnings.push(`${where}${skillMdPath}: body is ${charLen(body)} chars (warn cap ${budgets.skillBodyWarn})`);
+			warn(
+				`skill-body-warn:${skillMdPath}`,
+				`${where}${skillMdPath}: body is ${charLen(body)} chars (warn cap ${budgets.skillBodyWarn})`,
+			);
 		}
 
 		// Every skill must be named in the always-on file, or it is dead weight.
 		if (typeof agents === "string" && !agents.includes(dir)) {
-			errors.push(
+			err(
+				`skill-unnamed:${dir}`,
 				`${where}skill "${dir}" is not named in AGENTS.md — add a trigger line mentioning "${dir}" so the always-on context can route to it`,
 			);
 		}
@@ -333,7 +386,8 @@ function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): V
 		for (const ref of referenced) {
 			const full = `.pi/skills/${dir}/${ref}`;
 			if (!(full in surface)) {
-				errors.push(
+				err(
+					`skill-missing-ref:${skillMdPath}:${ref}`,
 					`${where}${skillMdPath}: references "${ref}" but the file is not part of the surface — ship it under scripts/ or drop the reference`,
 				);
 			}
@@ -341,14 +395,17 @@ function validateSurface(surface: Surface, cfg: RsiConfig, whereOpt?: string): V
 
 		const scriptCount = paths.filter((p) => p.startsWith(`.pi/skills/${dir}/scripts/`)).length;
 		if (scriptCount > MAX_FILES_PER_SKILL) {
-			errors.push(`${where}skill "${dir}" ships ${scriptCount} scripts, over the ${MAX_FILES_PER_SKILL} file cap`);
+			err(
+				`skill-script-cap:${dir}`,
+				`${where}skill "${dir}" ships ${scriptCount} scripts, over the ${MAX_FILES_PER_SKILL} file cap`,
+			);
 		}
 	}
 
 	// 4. Prompt files.
 	const promptFiles = Object.keys(surface).filter((p) => p.startsWith(".pi/prompts/"));
 	if (promptFiles.length > MAX_PROMPT_FILES) {
-		errors.push(`${where}${promptFiles.length} prompt files, over the ${MAX_PROMPT_FILES} file cap`);
+		err("prompt-file-cap", `${where}${promptFiles.length} prompt files, over the ${MAX_PROMPT_FILES} file cap`);
 	}
 
 	return { errors, warnings };
@@ -359,7 +416,7 @@ export function renderFileMap(surface: Surface, root = ""): string[] {
 	const prefix = root ? `${root.replace(/\/$/, "")}/` : "";
 	return Object.keys(surface)
 		.sort()
-		.map((path) => `${prefix}${path}  ${charLen(surface[path])} chars`);
+		.map((path) => `${prefix}${path}  ${charLen(surface[path] ?? "")} chars`);
 }
 
 export interface ScriptReviewOptions {
@@ -403,9 +460,74 @@ export function renderScriptReview(base: Surface, cand: Surface, opts: ScriptRev
 	return lines.join("\n");
 }
 
+export interface ContentReviewOptions {
+	maxFiles?: number;
+	maxLinesPerFile?: number;
+	totalChars?: number;
+}
+
+/**
+ * Adoption-gate review block for the *always-on* and *skill* prose files.
+ *
+ * The gate used to show only counts and paths (`~ AGENTS.md`), so the human
+ * approved an edit to the highest-leverage artifact — the file injected into
+ * every future context — without seeing a single line of it. This renders a
+ * bounded, line-level diff (whole-file for added files) with an explicit
+ * pointer to the full content when it is cut.
+ *
+ * Human-facing only: never assembled into a mission, so it costs no model
+ * context. Scripts are reviewed separately by `renderScriptReview`.
+ */
+export function renderContentReview(base: Surface, cand: Surface, opts: ContentReviewOptions = {}): string | undefined {
+	const maxFiles = opts.maxFiles ?? 3;
+	const maxLines = opts.maxLinesPerFile ?? 40;
+	const totalChars = opts.totalChars ?? 4_000;
+
+	const changed = Object.keys(cand)
+		.filter((p) => !RE_SKILL_SCRIPT.test(p) && cand[p] !== base[p])
+		.sort();
+	if (changed.length === 0) return undefined;
+
+	const lines = ["review these always-on / skill files — they are injected into future contexts:"];
+	let budget = totalChars;
+	let shown = 0;
+	for (const path of changed.slice(0, maxFiles)) {
+		const before = base[path];
+		const after = cand[path] ?? "";
+		const body = before === undefined ? after.split("\n").map((l) => `+ ${l}`) : lineDiff(before, after, maxLines);
+		const header = `! ${path}  ${before === undefined ? "added" : after === "" ? "deleted" : "modified"}`;
+		const block = truncateEnd([header, ...body].join("\n"), budget, "\n…[open the file for the rest]");
+		if (charLen(block) > budget) break;
+		lines.push(block);
+		budget -= charLen(block);
+		shown++;
+	}
+	if (shown < changed.length)
+		lines.push(`  … ${changed.length - shown} more changed file(s) not shown — open them before adopting`);
+	return lines.join("\n");
+}
+
+/** Line-level `-`/`+` diff, bounded to `maxLines` (common prefix/suffix trimmed). */
+function lineDiff(before: string, after: string, maxLines: number): string[] {
+	const a = before.split("\n");
+	const b = after.split("\n");
+	let start = 0;
+	while (start < a.length && start < b.length && a[start] === b[start]) start++;
+	let endA = a.length - 1;
+	let endB = b.length - 1;
+	while (endA >= start && endB >= start && a[endA] === b[endB]) {
+		endA--;
+		endB--;
+	}
+	const rows = [...a.slice(start, endA + 1).map((l) => `- ${l}`), ...b.slice(start, endB + 1).map((l) => `+ ${l}`)];
+	if (rows.length === 0) return ["(no line changes)"];
+	if (rows.length <= maxLines) return rows;
+	return [...rows.slice(0, maxLines), `… ${rows.length - maxLines} more changed line(s) — open the file`];
+}
+
 export function surfaceToJson(surface: Surface): string {
 	const sorted: Surface = {};
-	for (const path of Object.keys(surface).sort()) sorted[path] = surface[path];
+	for (const path of Object.keys(surface).sort()) sorted[path] = surface[path] ?? "";
 	return JSON.stringify(sorted, null, "\t");
 }
 
@@ -419,6 +541,11 @@ export function surfaceFromJson(text: string): Surface {
 	return parsed;
 }
 
+/** Whether two surfaces are byte-identical (canonical: key order does not matter). */
+export function sameSurface(a: Surface, b: Surface): boolean {
+	return surfaceHash(a) === surfaceHash(b);
+}
+
 /** One-line summary used in status output and mission headers. */
 export function summarizeDiff(diff: SurfaceDiff): string {
 	return (
@@ -427,6 +554,3 @@ export function summarizeDiff(diff: SurfaceDiff): string {
 		`${diff.charsDelta >= 0 ? "+" : ""}${diff.charsDelta} chars`
 	);
 }
-
-/** Regex helper re-exported for tests (kept here because paths are its concern). */
-export const pathGlob = globToRegExp;

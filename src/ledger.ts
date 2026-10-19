@@ -1,13 +1,14 @@
 /**
  * Ledger (README “Safety model”): Harness² budget identity `R = 4k` rollouts,
  * `P = 3k` improvement sessions, USD accounting, fallback counters and the
- * diversity metric — everything `/rsi-status` renders.
+ * diversity metric — everything `/rsi status` renders.
  *
  * Selection and reflection are recorded *outside* the identity (parity with
  * Harness² `ledger.py`), so they carry kind `selection` / `reflection` and are
  * excluded from R/P counting.
  */
 
+import { hostname } from "node:os";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
 import { ensureDir, exists, readTextIf, writeText } from "./util";
@@ -45,7 +46,23 @@ export interface LedgerFile {
 	budgetsUsed: Record<string, number>;
 	/** Mean line-Jaccard across composed candidates (mode-collapse detector). */
 	diversity: number | null;
-	outcome: "running" | "probed" | "adopted" | "pending" | "fell_back" | "aborted_budget" | "aborted" | "error";
+	outcome:
+		| "running"
+		| "probed"
+		| "adopted"
+		| "pending"
+		| "no_change"
+		| "fell_back"
+		| "aborted_budget"
+		| "aborted"
+		| "error";
+	/**
+	 * The pid (and host) of the process that owns the run. A ledger left at
+	 * `outcome: "running"` by a process that died — the exact case of a headless
+	 * `pi --print` whose parent exits mid-run — can then be told apart from a run
+	 * that is genuinely still alive. Absent on old ledgers (treated as unknown).
+	 */
+	owner?: { pid: number; host: string };
 	chosen: string | null;
 	adopted: boolean;
 	notes: string[];
@@ -74,6 +91,7 @@ export function newLedger(
 		budgetsUsed: {},
 		diversity: null,
 		outcome: "running",
+		owner: { pid: process.pid, host: hostname() },
 		chosen: null,
 		adopted: false,
 		notes: [],
@@ -136,10 +154,6 @@ export function totalUsd(ledger: LedgerFile): number {
 	return ledger.entries.reduce((sum, e) => sum + (Number.isFinite(e.usd) ? e.usd : 0), 0);
 }
 
-export function usdByKind(ledger: LedgerFile, kind: LedgerKind): number {
-	return ledger.entries.filter((e) => e.kind === kind).reduce((sum, e) => sum + e.usd, 0);
-}
-
 export interface StatusInput {
 	ledger: LedgerFile;
 	cfg: RsiConfig;
@@ -147,7 +161,7 @@ export interface StatusInput {
 	budgetsUsed?: Record<string, number>;
 }
 
-/** Multi-line `/rsi-status` report. Pure — the command only prints it. */
+/** Multi-line `/rsi status` report. Pure — the command only prints it. */
 export function renderStatus(input: StatusInput): string {
 	const { ledger, cfg } = input;
 	const identity = assertIdentity(ledger);

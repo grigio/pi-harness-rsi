@@ -116,7 +116,7 @@ export function assertAdoptionAllowed(cfg: Pick<RsiConfig, "confirmAdopt">, conf
 	if (!cfg.confirmAdopt) return;
 	if (!confirmed) {
 		throw new AdoptionGateError(
-			"adoption not confirmed — surface unchanged; run /rsi-adopt <label> to adopt a composed candidate",
+			"adoption not confirmed — surface unchanged; run /rsi adopt <label> to adopt a composed candidate",
 		);
 	}
 }
@@ -124,6 +124,8 @@ export function assertAdoptionAllowed(cfg: Pick<RsiConfig, "confirmAdopt">, conf
 export interface DirtyReport {
 	dirty: boolean;
 	lines: string[];
+	/** Set when `git status` itself failed for a reason other than "not a repo". */
+	error?: string;
 }
 
 /**
@@ -147,7 +149,7 @@ export function workingTreeStatus(cwd: string): DirtyReport {
 		const out = execSync("git status --porcelain --untracked-files=all", {
 			cwd,
 			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
+			stdio: ["ignore", "pipe", "pipe"],
 		});
 		const lines = out
 			.split("\n")
@@ -159,17 +161,26 @@ export function workingTreeStatus(cwd: string): DirtyReport {
 				return !isHarnessEphemeral(path.replace(/^"|"$/g, ""));
 			});
 		return { dirty: lines.length > 0, lines };
-	} catch {
-		// Not a git repository (or git missing): nothing to protect, nothing to leak.
-		return { dirty: false, lines: [] };
+	} catch (err) {
+		// Distinguish "this is not a git repository" (nothing to protect, nothing
+		// to leak) from "git itself failed" (index.lock, transient I/O, git
+		// missing). Treating the second as clean was fail-*open*: adoption could
+		// clobber uncommitted work because the safety check could not run.
+		const e = err as { stderr?: string | Buffer; stdout?: string | Buffer; message?: string };
+		const text = `${e.stderr ?? ""}\n${e.stdout ?? ""}\n${e.message ?? ""}`;
+		if (/not a git repository|not a git work tree/i.test(String(text))) return { dirty: false, lines: [] };
+		const message = String(e.stderr ?? "").trim() || e.message || "git status failed";
+		return { dirty: true, lines: [`<git status failed: ${message.slice(0, 200)}>`], error: message };
 	}
 }
 
 export class DirtyTreeError extends Error {
-	constructor(lines: string[]) {
-		super(
-			`working tree has uncommitted changes (${lines.length} paths) — commit/stash first or pass --force so adoption cannot clobber local work`,
-		);
+	constructor(report: DirtyReport | string[]) {
+		const report2: DirtyReport = Array.isArray(report) ? { dirty: true, lines: report } : report;
+		const detail = report2.error
+			? `git status could not run (${report2.error.slice(0, 160)}) — refusing to treat the tree as clean`
+			: `working tree has uncommitted changes (${report2.lines.length} paths) — commit/stash first or pass --force so adoption cannot clobber local work`;
+		super(detail);
 		this.name = "DirtyTreeError";
 	}
 }

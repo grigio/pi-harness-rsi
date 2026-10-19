@@ -43,7 +43,7 @@ import {
 	saveLedger,
 	totalUsd,
 } from "./ledger";
-import { adoptSurface, loadLessons, regenerateIndex, writeLessonIfValid } from "./library";
+import { adoptSurface, loadLessons, regenerateIndex, resolveRevertTarget, writeLessonIfValid } from "./library";
 import { acquireRunLock, RunLockedError } from "./lock";
 import { type ProbeResult, runProbe } from "./probe";
 import { pruneRuns } from "./retention";
@@ -61,10 +61,12 @@ import {
 	applyDelta,
 	diffSurface,
 	readSurface,
+	renderContentReview,
 	renderScriptReview,
 	type Surface,
 	type SurfaceDelta,
 	type SurfaceDiff,
+	sameSurface,
 	surfaceFromJson,
 	surfaceToJson,
 	validate,
@@ -73,18 +75,18 @@ import {
 import {
 	exists,
 	extractTag,
-	hash12,
 	jaccardLines,
 	listFiles,
 	mapLimit,
 	nowRunId,
 	readTextIf,
 	sanitizeSegment,
+	segmentError,
 	slugify,
 	writeText,
 } from "./util";
-import { type ActiveRun, beginRun, endRun, pushLiveNote, type RunKind, STOP_FILE, setStage } from "./watch";
-import { cleanupSandboxes, ensureHarnessIgnored, prepareSandbox, type Sandbox } from "./worktree";
+import { type ActiveRun, beginRun, endRun, pushLiveNote, type RunKind, runIsLive, STOP_FILE, setStage } from "./watch";
+import { cleanupSandboxes, ensureHarnessIgnored, prepareSandbox, type Sandbox, sandboxId } from "./worktree";
 
 // __PART2__
 
@@ -92,7 +94,7 @@ export type LogLevel = "info" | "warn" | "error" | "success";
 
 export interface LoopIO {
 	log(message: string, level?: LogLevel): void;
-	/** Adoption gate (P6). Omit for headless/test runs — adoption then needs `/rsi-adopt`. */
+	/** Adoption gate (P6). Omit for headless/test runs — adoption then needs `/rsi adopt`. */
 	confirmAdoption?(title: string, message: string): Promise<boolean>;
 }
 
@@ -138,7 +140,7 @@ interface RunContext {
 	domain: string;
 	errors: string[];
 	budgetsUsed: Record<string, number>;
-	/** Live registry entry (/rsi-watch) + merged abort signal (/rsi-stop). */
+	/** Live registry entry (/rsi watch) + merged abort signal (/rsi stop). */
 	watch: ActiveRun;
 	signal: AbortSignal;
 	/** The live tree matched HEAD at run start (worktree sandboxes are safe);
@@ -150,7 +152,7 @@ interface RunContext {
 
 /**
  * Register the run in the live registry and merge the caller's signal into the
- * stop controller, so both `/rsi-stop` and `LoopOptions.signal` interrupt it.
+ * stop controller, so both `/rsi stop` and `LoopOptions.signal` interrupt it.
  */
 function attachWatch(
 	target: { runId: string; runDir: string; task: string; domain: string; kind: RunKind },
@@ -164,26 +166,36 @@ function attachWatch(
 	return { watch: run, signal: run.controller.signal };
 }
 
-function createRun(opts: LoopOptions, outcome: Outcome = "running"): RunContext {
+function createRun(opts: LoopOptions, kind: RunKind = "loop"): RunContext {
 	const runId = opts.runId ?? nowRunId(opts.task);
+	// A caller-supplied run id becomes a path segment (`runs/<id>`), so it must
+	// not be able to escape the runs directory.
+	const runIdError = segmentError(runId, "run id");
+	if (runIdError) throw new Error(`invalid run id: ${runIdError}`);
 	const lock = acquireRunLock(opts.cwd, runId);
-	if (!lock.ok) throw new RunLockedError(lock.holder);
+	if (!lock.ok) throw new RunLockedError(lock.holder, opts.cwd);
 	let started = false;
 	try {
 		const pruned = pruneRuns(opts.cwd, { keepRuns: opts.cfg.keepRuns, protect: [runId] });
 		const runsRoot = join(opts.cwd, ".pi", "harness", "runs");
 		const runDir = join(runsRoot, runId);
 		ensureHarnessIgnored(opts.cwd);
-		const cleaned = cleanupSandboxes(opts.cwd, opts.cfg, { protect: [runId] });
+		// `cleanupSandboxes` prunes by *sandbox* dir name (`<label>-<hash>`), not by
+		// run id — run protection is `pruneRuns`' job. Each probe registers its own
+		// sandbox dir while it is live (see `probeSurface`).
+		const cleaned = cleanupSandboxes(opts.cwd, opts.cfg);
 		const ledger = newLedger(runId, opts.task, sanitizeSegment(opts.domain), opts.cfg);
-		ledger.outcome = outcome;
+		// Always `running` while the run lives, including probe-only runs: the disk
+		// view is how another session finds it, and it filters on `outcome ===
+		// "running"`. `finish()` is what writes the terminal outcome.
+		ledger.outcome = "running";
 		const live = attachWatch(
 			{
 				runId,
 				runDir,
 				task: opts.task,
 				domain: sanitizeSegment(opts.domain),
-				kind: outcome === "probed" ? "probe" : "loop",
+				kind,
 			},
 			opts.signal,
 		);
@@ -251,7 +263,7 @@ function outOfBudget(ctx: RunContext): boolean {
 	return false;
 }
 
-/** User interruption (`/rsi-stop`, or a `STOP` file from another session) wins over the budget check; both fail closed. */
+/** User interruption (`/rsi stop`, or a `STOP` file from another session) wins over the budget check; both fail closed. */
 function stopOutcome(ctx: RunContext): Outcome | null {
 	if (ctx.signal.aborted || exists(join(ctx.runDir, STOP_FILE))) return "aborted";
 	if (outOfBudget(ctx)) return "aborted_budget";
@@ -281,7 +293,7 @@ async function probeSurface(
 	opts: { signal?: AbortSignal } = {},
 ): Promise<ProbeResult> {
 	const cfg = ctx.cfg;
-	const id = `${label}-${hash12(`${ctx.runId}:${label}`).slice(0, 8)}`;
+	const id = sandboxId(ctx.runId, label);
 	setStage(ctx.watch, `probe ${label}`);
 	const sandbox: Sandbox = prepareSandbox(ctx.cwd, cfg, {
 		id,
@@ -301,6 +313,16 @@ async function probeSurface(
 		});
 		addEntry(ctx.ledger, { kind: "rollout", label, usd: result.usd, attempts: 1, wallMs: result.wallMs });
 		if (!result.ok) note(ctx, `rollout ${label} exited ${result.exitCode}: ${result.error ?? "unknown error"}`, "warn");
+		// The design promise is "nothing is silently truncated": a digest that had
+		// to drop sections must say so where the user reads the run, not only in
+		// the digest text itself.
+		if (result.digestCapped) {
+			note(
+				ctx,
+				`digest ${label} capped at ${cfg.budgets.digest} chars — dropped sections: ${result.digestDropped.join(", ") || "tail"}`,
+				"warn",
+			);
+		}
 		save(ctx);
 		return result;
 	} finally {
@@ -575,16 +597,16 @@ export function diversityOf(surfaces: readonly Surface[]): number | null {
 	let pairs = 0;
 	for (let i = 0; i < surfaces.length; i++) {
 		for (let j = i + 1; j < surfaces.length; j++) {
-			sum += jaccardLines(surfaceText(surfaces[i]), surfaceText(surfaces[j]));
+			sum += jaccardLines(surfaceText(surfaces[i] as Surface), surfaceText(surfaces[j] as Surface));
 			pairs++;
 		}
 	}
 	return pairs > 0 ? sum / pairs : null;
 }
 
-/** `/rsi-probe <task>` — reference executions + digests only, zero edits (P0). */
+/** `/rsi probe <task>` — reference executions + digests only, zero edits (P0). */
 export async function runReferenceProbes(opts: LoopOptions): Promise<LoopReport> {
-	const ctx = createRun(opts, "probed");
+	const ctx = createRun(opts, "probe");
 	try {
 		const base = readSurface(opts.cwd, opts.cfg);
 		if (base["AGENTS.md"] === undefined) base["AGENTS.md"] = "# Project instructions\n";
@@ -613,19 +635,27 @@ export async function runReferenceProbes(opts: LoopOptions): Promise<LoopReport>
 /** `/rsi <task>` — the full task-level recursion. */
 export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 	const cfg = opts.cfg;
-	const ctx = createRun(opts, "running");
+	// Refuse a dirty tree *before* creating anything: the run used to create its
+	// run dir and write `.pi/harness/.gitignore` and then fail, leaving noise
+	// behind for a run that never ran.
+	if (cfg.requireClean && !opts.force) {
+		const status = workingTreeStatus(opts.cwd);
+		if (status.dirty) throw new DirtyTreeError(status);
+	}
+	const ctx = createRun(opts, "loop");
 
 	try {
-		if (cfg.requireClean && !opts.force) {
-			const status = workingTreeStatus(opts.cwd);
-			if (status.dirty) throw new DirtyTreeError(status.lines);
-		}
-
 		// --- snapshot(base) -------------------------------------------------
 		const base = readSurface(opts.cwd, cfg);
 		if (base["AGENTS.md"] === undefined) {
+			// The always-on file is real project state, not run scratch: rather than
+			// carrying a synthesized file only inside the run, materialize a starter
+			// AGENTS.md in the tree so adoption — and the user's own edits — start
+			// from a file that actually exists. (Reference-only `/rsi probe` keeps
+			// its synthesis in memory: that verb promises zero edits.)
 			base["AGENTS.md"] = "# Project instructions\n";
-			note(ctx, "no AGENTS.md in the working tree — synthesized an empty always-on file for this run");
+			writeText(join(opts.cwd, "AGENTS.md"), base["AGENTS.md"]);
+			note(ctx, "no AGENTS.md in the working tree — created a starter always-on file (AGENTS.md in the project root)");
 		}
 		writeText(join(ctx.runDir, "base", "surface.json"), surfaceToJson(base));
 		const baseReport = validate(base, cfg, { where: "base" });
@@ -656,7 +686,7 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 				lever,
 				index,
 				base,
-				refDigest: refs[index].digest,
+				refDigest: (refs[index] as ProbeResult).digest,
 				evidence: evidenceFor(index),
 				library,
 				carry,
@@ -683,7 +713,7 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 			// --- probe(candidates) (R += 2k) --------------------------------
 			const labels = [`inv${index}`, `dom${index}`];
 			const candProbes = await mapLimit(
-				range(2).map((j) => ({ surface: candidates[j].surface, label: labels[j] })),
+				range(2).map((j) => ({ surface: (candidates[j] as ProposedCandidate).surface, label: labels[j] as string })),
 				cfg.maxParallel,
 				(job) => probeSurface(ctx, job.surface, job.label, { signal: ctx.signal }),
 			);
@@ -696,7 +726,7 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 			const finalCandidate = await composeStage(ctx, {
 				index,
 				base,
-				refProbe: refs[index],
+				refProbe: refs[index] as ProbeResult,
 				candidates,
 				library,
 				carry,
@@ -745,6 +775,7 @@ export async function runLoop(opts: LoopOptions): Promise<LoopReport> {
 		const gate = await resolveAdoptionGate(ctx, chosenLabel, chosenEntry.candidate.surface, base, opts);
 		if (!gate.ok) {
 			if (gate.stopped) return finish(ctx, { outcome: "aborted", chosen: chosenLabel });
+			if (gate.noChange) return finish(ctx, { outcome: "no_change", chosen: chosenLabel });
 			return finish(ctx, { outcome: gate.aborted ? "error" : "pending", chosen: chosenLabel, errors: gate.aborted });
 		}
 		return finish(ctx, { outcome: "adopted", chosen: chosenLabel, adopted: true });
@@ -857,8 +888,10 @@ async function selectStage(ctx: RunContext, args: SelectArgs): Promise<Selection
 interface GateResult {
 	ok: boolean;
 	aborted?: boolean;
-	/** The run was interrupted (/rsi-stop) before the gate — close as `aborted`. */
+	/** The run was interrupted (/rsi stop) before the gate — close as `aborted`. */
 	stopped?: boolean;
+	/** The candidate surface equals the live one — close as `no_change`. */
+	noChange?: boolean;
 	message: string;
 }
 
@@ -876,7 +909,7 @@ async function resolveAdoptionGate(
 	}
 	const dirty = workingTreeStatus(ctx.cwd);
 	if (dirty.dirty && !opts.force) {
-		const err = new DirtyTreeError(dirty.lines);
+		const err = new DirtyTreeError(dirty);
 		note(ctx, `adoption refused: ${err.message}`, "warn");
 		return { ok: false, aborted: true, message: err.message };
 	}
@@ -885,13 +918,16 @@ async function resolveAdoptionGate(
 	if (!confirmed) {
 		const summary = diffText(`adopt ${label}`, diffSurface(base, surface));
 		const scriptReview = renderScriptReview(base, surface);
+		const contentReview = renderContentReview(base, surface);
 		if (opts.io.confirmAdoption) {
 			confirmed = await opts.io.confirmAdoption(
 				`rsi: adopt ${label}?`,
-				`${summary}${scriptReview ? `\n\n${scriptReview}` : ""}\n\nThe live tree is updated and a library snapshot is written.`,
+				`${[summary, contentReview, scriptReview]
+					.filter((part): part is string => typeof part === "string" && part.length > 0)
+					.join("\n\n")}\n\nThe live tree is updated and a library snapshot is written.`,
 			);
 		} else {
-			note(ctx, `adoption pending: ${label} — no confirmation channel here, run /rsi-adopt ${label}`, "warn");
+			note(ctx, `adoption pending: ${label} — no confirmation channel here, run /rsi adopt ${label}`, "warn");
 			return { ok: false, message: "confirmation required" };
 		}
 	}
@@ -907,7 +943,15 @@ async function resolveAdoptionGate(
 	}
 
 	const liveBefore = readSurface(ctx.cwd, cfg);
-	writeSurface(ctx.cwd, surface, { prune: true });
+	// A candidate that changes nothing is not an improvement: writing it would
+	// report `adopted` for a no-op and seed the library with a lesson attributed
+	// to an adoption that never happened. Close as `no_change` instead.
+	if (sameSurface(liveBefore, surface)) {
+		note(ctx, `${label} is identical to the live surface — nothing to adopt; the harness produced no change`, "warn");
+		return { ok: false, noChange: true, message: "no change" };
+	}
+
+	writeSurface(ctx.cwd, surface, { prune: true, base: liveBefore, cfg });
 	adoptSurface(ctx.cwd, cfg, { domain: ctx.domain, slug: slugify(ctx.task), liveBefore, adopted: surface });
 	regenerateIndex(ctx.cwd, cfg, ctx.domain);
 	ctx.ledger.adopted = true;
@@ -1023,7 +1067,7 @@ interface FinishOptions {
 function finish(ctx: RunContext, opts: FinishOptions): LoopReport {
 	ctx.ledger.outcome = opts.outcome;
 	if (opts.outcome === "aborted")
-		note(ctx, "run interrupted via /rsi-stop — nothing adopted, evidence kept under the run dir", "warn");
+		note(ctx, "run interrupted via /rsi stop — nothing adopted, evidence kept under the run dir", "warn");
 	if (opts.chosen !== undefined) ctx.ledger.chosen = opts.chosen;
 	if (opts.adopted) ctx.ledger.adopted = true;
 	save(ctx);
@@ -1107,32 +1151,53 @@ export function runDirFor(cwd: string, runId?: string): string | undefined {
 	return latestRunDir(cwd);
 }
 
-/** `/rsi-status [runId]` — pure render of the persisted ledger. */
+/** `/rsi status [runId]` — pure render of the persisted ledger. */
 export function statusOfRun(opts: Pick<CommandOptions, "cwd" | "cfg" | "runId">): { ok: boolean; text: string } {
 	const runDir = runDirFor(opts.cwd, opts.runId);
-	if (!runDir) return { ok: false, text: "no rsi runs yet — start one with /rsi <task> or /rsi-probe <task>" };
+	if (!runDir)
+		return { ok: false, text: "no rsi runs yet — /rsi probe <task> for evidence, /rsi start <task> for the full loop" };
 	const ledger = loadLedger(runDir);
 	if (!ledger) return { ok: false, text: `run ${runDir} has no readable ledger.json` };
-	return { ok: true, text: renderStatus({ ledger, cfg: opts.cfg }) };
+	// A ledger still marked `running` by a process that no longer exists is a
+	// phantom (e.g. a headless run whose parent exited): report it as such
+	// instead of describing a run that is not in flight.
+	const orphan = ledger.outcome === "running" && !runIsLive(ledger, opts.cwd);
+	return {
+		ok: true,
+		text: orphan
+			? `${renderStatus({ ledger, cfg: opts.cfg })}\nnote: this run's owner process is gone — it never finished; evidence is kept, nothing was adopted`
+			: renderStatus({ ledger, cfg: opts.cfg }),
+	};
 }
 
-/** Status-bar headline for a rendered `/rsi-status` report (no line-index coupling). */
+/** Status-bar headline for a rendered `/rsi status` report (no line-index coupling). */
 export function statusHeadline(text: string): string {
 	return text.split("\n").find((line) => line.startsWith("outcome:")) ?? "rsi";
 }
 
 /**
- * `/rsi-adopt [label]` — the human gate as a command: apply a composed surface
+ * `/rsi adopt [label]` — the human gate as a command: apply a composed surface
  * from an earlier run to the live tree, snapshot it into the library, then
  * reflect. Fail-closed: the run's own validators run again before applying.
  */
 export async function adoptCandidate(opts: CommandOptions): Promise<CommandResult> {
+	const runIdError = opts.runId ? segmentError(opts.runId, "run id") : undefined;
+	if (runIdError) return { ok: false, message: `invalid run id: ${runIdError}` };
 	const runDir = runDirFor(opts.cwd, opts.runId);
 	if (!runDir) return { ok: false, message: "no rsi run found to adopt from" };
 	const ledger = loadLedger(runDir);
 	if (!ledger) return { ok: false, message: "run has no readable ledger.json" };
 
 	const label = opts.label ?? ledger.chosen ?? "final0";
+	// The label is a path segment (`surfaces/<label>.json`). Without this check a
+	// label like `../../../../evil` read — and adopted — any JSON file on disk.
+	const labelError = segmentError(label, "label");
+	if (labelError) {
+		return {
+			ok: false,
+			message: `invalid label: ${labelError} — labels are surface snapshot names such as final0, inv0, dom1`,
+		};
+	}
 	const surfacePath = join(runDir, "surfaces", `${label}.json`);
 	const raw = readTextIf(surfacePath);
 	if (!raw) {
@@ -1169,16 +1234,27 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 
 	const dirty = workingTreeStatus(opts.cwd);
 	if (dirty.dirty && !opts.force) {
-		return { ok: false, message: new DirtyTreeError(dirty.lines).message };
+		return { ok: false, message: new DirtyTreeError(dirty).message };
+	}
+
+	// Nothing to adopt: the live tree already is this surface.
+	if (sameSurface(liveBefore, surface)) {
+		return {
+			ok: false,
+			message: `${label} is identical to the live surface — nothing to adopt (the run produced no change)`,
+		};
 	}
 
 	let confirmed = !cfg.confirmAdopt || opts.confirmed === true;
 	if (!confirmed) {
 		if (opts.io.confirmAdoption) {
 			const scriptReview = renderScriptReview(liveBefore, surface);
+			const contentReview = renderContentReview(liveBefore, surface);
 			confirmed = await opts.io.confirmAdoption(
 				`rsi: adopt ${label}?`,
-				diffText(`adopt ${label}`, diffSurface(liveBefore, surface)) + (scriptReview ? `\n\n${scriptReview}` : ""),
+				[diffText(`adopt ${label}`, diffSurface(liveBefore, surface)), contentReview, scriptReview]
+					.filter((part): part is string => typeof part === "string" && part.length > 0)
+					.join("\n\n"),
 			);
 		} else {
 			return { ok: false, message: `confirmation required (pass --yes) to adopt ${label}` };
@@ -1187,7 +1263,7 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 	if (!confirmed) return { ok: false, message: `adoption of ${label} declined — live tree untouched` };
 
 	const lock = acquireRunLock(opts.cwd, ledger.runId);
-	if (!lock.ok) return { ok: false, message: new RunLockedError(lock.holder).message };
+	if (!lock.ok) return { ok: false, message: new RunLockedError(lock.holder, opts.cwd).message };
 
 	const run = attachWatch({ runId: ledger.runId, runDir, task: ledger.task, domain: ledger.domain, kind: "adopt" });
 	if (run.signal.aborted) {
@@ -1211,16 +1287,111 @@ export async function adoptCandidate(opts: CommandOptions): Promise<CommandResul
 		clean: !dirty.dirty,
 		releaseLock: lock.release,
 	};
-	writeSurface(opts.cwd, surface, { prune: true });
-	adoptSurface(opts.cwd, cfg, { domain: ctx.domain, slug: slugify(ledger.task), liveBefore, adopted: surface });
-	regenerateIndex(opts.cwd, cfg, ctx.domain);
-	ctx.ledger.adopted = true;
-	ctx.ledger.chosen = label;
-	ctx.ledger.outcome = "adopted";
-	save(ctx);
-	note(ctx, `adopted ${label} via /rsi-adopt`, "success");
 
-	await reflectStage(ctx, { label, base: liveBefore, adopted: surface, signal: ctx.signal });
-	const finalReport = finish(ctx, { outcome: "adopted", chosen: label, adopted: true });
-	return { ok: true, message: `adopted ${label}`, report: finalReport };
+	// The apply is a transaction: any throw after the first write restores the
+	// live surface, and the lock + live registry are released in `finally`. A
+	// leaked lock used to wedge the project for the full 12 h stale window.
+	let applied = false;
+	try {
+		writeSurface(opts.cwd, surface, { prune: true, base: liveBefore, cfg });
+		applied = true;
+		adoptSurface(opts.cwd, cfg, { domain: ctx.domain, slug: slugify(ledger.task), liveBefore, adopted: surface });
+		regenerateIndex(opts.cwd, cfg, ctx.domain);
+		ctx.ledger.adopted = true;
+		ctx.ledger.chosen = label;
+		ctx.ledger.outcome = "adopted";
+		save(ctx);
+		note(ctx, `adopted ${label} via /rsi adopt`, "success");
+
+		await reflectStage(ctx, { label, base: liveBefore, adopted: surface, signal: ctx.signal });
+		const finalReport = finish(ctx, { outcome: "adopted", chosen: label, adopted: true });
+		return { ok: true, message: `adopted ${label}`, report: finalReport };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		ctx.errors.push(message);
+		if (applied) {
+			try {
+				writeSurface(opts.cwd, liveBefore, { prune: true, base: surface, cfg });
+				ctx.errors.push("live tree restored to the pre-adoption surface");
+			} catch (restoreErr) {
+				ctx.errors.push(
+					`restore failed (${(restoreErr as Error).message}) — the library's previous/ snapshot still holds the pre-adoption surface`,
+				);
+			}
+		}
+		ctx.ledger.adopted = false;
+		ctx.ledger.chosen = label;
+		save(ctx);
+		// `finish` releases the lock and clears the live registry.
+		finish(ctx, { outcome: "error", chosen: label, errors: true });
+		return { ok: false, message: `adoption failed: ${message}` };
+	}
+}
+
+export interface RevertCommandOptions {
+	cwd: string;
+	cfg: RsiConfig;
+	force?: boolean;
+	domain?: string;
+	slug?: string;
+}
+
+/**
+ * `/rsi revert <domain>/<slug>` — restore a library snapshot into the live tree.
+ *
+ * The previous implementation wrote the snapshot directly and skipped every
+ * guard adoption has: no dirty-tree check, no run lock, no re-validation and no
+ * rollback, so a revert could silently clobber uncommitted work or race an
+ * adoption. This is the same transaction as `adoptCandidate`, minus the ledger
+ * (a revert is not a run).
+ */
+export async function revertAdopted(opts: RevertCommandOptions): Promise<CommandResult> {
+	const resolved = resolveRevertTarget(opts.cwd, opts.cfg, { domain: opts.domain, slug: opts.slug });
+	if (!resolved.ok) return { ok: false, message: resolved.message };
+	const { domain, slug, snapshot } = resolved.target;
+	const cfg = opts.cfg;
+
+	const liveBefore = readSurface(opts.cwd, cfg);
+	// Delta-only: restoring must not be blocked by an issue the snapshot does
+	// not introduce, but must be blocked by one it would.
+	const report = validate(snapshot, cfg, { where: `${domain}/${slug}`, base: liveBefore });
+	if (report.errors.length > 0) {
+		return { ok: false, message: `snapshot fails validation, not restoring:\n${report.errors.join("\n")}` };
+	}
+	if (sameSurface(liveBefore, snapshot)) {
+		return { ok: false, message: `${domain}/${slug} is already the live surface — nothing to restore` };
+	}
+
+	const dirty = workingTreeStatus(opts.cwd);
+	if (dirty.dirty && !opts.force) return { ok: false, message: new DirtyTreeError(dirty).message };
+
+	const lock = acquireRunLock(opts.cwd, `revert-${slug}`);
+	if (!lock.ok) return { ok: false, message: new RunLockedError(lock.holder, opts.cwd).message };
+
+	let applied = false;
+	try {
+		writeSurface(opts.cwd, snapshot, { prune: true, base: liveBefore, cfg });
+		applied = true;
+		return {
+			ok: true,
+			message: `restored previous surface for ${domain}/${slug}`,
+		};
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (applied) {
+			try {
+				writeSurface(opts.cwd, liveBefore, { prune: true, base: snapshot, cfg });
+			} catch (restoreErr) {
+				return {
+					ok: false,
+					message:
+						`revert failed: ${message}; restore also failed (${(restoreErr as Error).message}) — ` +
+						`the library's previous/ snapshot still holds the pre-revert surface`,
+				};
+			}
+		}
+		return { ok: false, message: `revert failed: ${message}` };
+	} finally {
+		lock.release();
+	}
 }

@@ -16,8 +16,9 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RsiConfig } from "./config";
+import { runProcess } from "./proc";
 import { type Surface, writeSurface } from "./surface";
-import { copyDir, ensureDir, readTextIf, rmrf, writeText } from "./util";
+import { copyDir, ensureDir, hash12, readTextIf, rmrf, writeText } from "./util";
 
 export type SandboxKind = "worktree" | "copy";
 
@@ -27,7 +28,7 @@ export interface Sandbox {
 	/** Stage a surface into the sandbox (prunes surface files the candidate dropped). */
 	stage(surface: Surface): void;
 	/** `+A −D` numstat against HEAD, when the sandbox is a git worktree. */
-	diffStat(): string | undefined;
+	diffStat(): Promise<string | undefined>;
 	/** Idempotent removal (called from `finally`). */
 	cleanup(): void;
 }
@@ -60,6 +61,21 @@ export function ensureHarnessIgnored(repoRoot: string): void {
 /** Resolved sandbox root inside the repo (relative settings resolve from the repo). */
 export function worktreeRootPath(repoRoot: string, cfg: Pick<RsiConfig, "worktreeRoot">): string {
 	return cfg.worktreeRoot.startsWith("/") ? cfg.worktreeRoot : join(repoRoot, cfg.worktreeRoot);
+}
+
+/**
+ * Short, stable token identifying a run inside a sandbox directory name. The
+ * token leads the name so `cleanupSandboxes({ protect: [runId] })` can skip a
+ * live run's sandboxes without having to reverse a hash that also mixed in the
+ * label.
+ */
+export function runToken(runId: string): string {
+	return hash12(runId).slice(0, 6);
+}
+
+/** Directory name for one rollout: unique per run *and* per label. */
+export function sandboxId(runId: string, label: string): string {
+	return `${runToken(runId)}-${hash12(`${runId}:${label}`).slice(0, 8)}-${label}`;
 }
 
 export interface PrepareOptions {
@@ -112,26 +128,29 @@ function makeWorktreeSandbox(repoRoot: string, path: string): Sandbox {
 		stage(surface: Surface): void {
 			writeSurface(path, surface, { prune: true });
 		},
-		diffStat(): string | undefined {
-			try {
-				execFileSync("git", ["add", "-A"], { cwd: path, stdio: ["ignore", "ignore", "ignore"] });
-				const numstat = execFileSync("git", ["diff", "--cached", "--numstat", "HEAD"], {
-					cwd: path,
-					encoding: "utf8",
-					stdio: ["ignore", "pipe", "ignore"],
-				});
-				let added = 0;
-				let removed = 0;
-				for (const line of numstat.split("\n")) {
-					const m = line.match(/^(\d+)\t(\d+)\t/);
-					if (!m) continue;
-					added += Number(m[1]);
-					removed += Number(m[2]);
+		diffStat(): Promise<string | undefined> {
+			return (async (): Promise<string | undefined> => {
+				try {
+					const add = await runProcess("git", ["add", "-A"], { cwd: path, timeoutMs: 60_000 });
+					if (add.code !== 0) return undefined;
+					const diff = await runProcess("git", ["diff", "--cached", "--numstat", "HEAD"], {
+						cwd: path,
+						timeoutMs: 60_000,
+					});
+					if (diff.code !== 0) return undefined;
+					let added = 0;
+					let removed = 0;
+					for (const line of diff.stdout.split("\n")) {
+						const m = line.match(/^(\d+)\t(\d+)\t/);
+						if (!m) continue;
+						added += Number(m[1]);
+						removed += Number(m[2]);
+					}
+					return `+${added} −${removed}`;
+				} catch {
+					return undefined;
 				}
-				return `+${added} −${removed}`;
-			} catch {
-				return undefined;
-			}
+			})();
 		},
 		cleanup(): void {
 			if (cleaned) return;
@@ -161,8 +180,8 @@ function makeCopySandbox(path: string): Sandbox {
 		stage(surface: Surface): void {
 			writeSurface(path, surface, { prune: true });
 		},
-		diffStat(): string | undefined {
-			return undefined;
+		diffStat(): Promise<string | undefined> {
+			return Promise.resolve(undefined);
 		},
 		cleanup(): void {
 			if (cleaned) return;
@@ -182,27 +201,27 @@ export interface VerifierEvidence {
  * Run `rsi.verifier` inside the sandbox and return an *evidence* line.
  * The editor is never shown a score target (P5): this is what happened when the
  * artifact ran, not what the grader wants.
+ *
+ * Asynchronous and abortable on purpose: the previous `execSync` blocked the
+ * extension event loop for up to two minutes, which froze the footer spinner,
+ * `watch --follow` polling and — critically — made `/rsi stop` unable to
+ * terminate a hung verifier.
  */
-export function runVerifier(
+export async function runVerifier(
 	sandboxPath: string,
 	cfg: Pick<RsiConfig, "verifier" | "stageTimeoutMs">,
-): VerifierEvidence | undefined {
+	signal?: AbortSignal,
+): Promise<VerifierEvidence | undefined> {
 	if (!cfg.verifier) return undefined;
-	try {
-		const out = execSync(cfg.verifier, {
-			cwd: sandboxPath,
-			shell: "/bin/bash",
-			encoding: "utf8",
-			timeout: Math.min(cfg.stageTimeoutMs, 120_000),
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		return { line: `${cfg.verifier} exit=0${tailOf(out)}`, exit: 0 };
-	} catch (err) {
-		const e = err as { status?: number; stdout?: string; stderr?: string; message?: string };
-		const exit = typeof e.status === "number" ? e.status : undefined;
-		const body = `${e.stdout ?? ""}\n${e.stderr ?? ""}`.trim() || e.message || "";
-		return { line: `${cfg.verifier} exit=${exit ?? "?"}${tailOf(body)}`, exit };
-	}
+	const result = await runProcess("/bin/bash", ["-c", cfg.verifier], {
+		cwd: sandboxPath,
+		timeoutMs: Math.min(cfg.stageTimeoutMs, 120_000),
+		signal,
+	});
+	const body = `${result.stdout}\n${result.stderr}`.trim() || result.error || "";
+	if (result.code === 0 && !result.killed) return { line: `${cfg.verifier} exit=0${tailOf(result.stdout)}`, exit: 0 };
+	const outcome = result.timedOut ? "timeout" : result.killed ? "aborted" : String(result.code);
+	return { line: `${cfg.verifier} exit=${outcome}${tailOf(body)}`, exit: result.killed ? undefined : result.code };
 }
 
 function tailOf(text: string, max = 300): string {
@@ -252,7 +271,9 @@ export function cleanupSandboxes(
 	if (!existsSync(root)) return { dirs, worktreePruned };
 	try {
 		for (const entry of readdirSync(root, { withFileTypes: true })) {
-			if (!entry.isDirectory() || protect.has(entry.name)) continue;
+			// `protect` holds run ids; a sandbox dir is named `<run-token>-<label>`
+			// (see `sandboxId`), so the owning run is recovered from the prefix.
+			if (protect.size > 0 && [...protect].some((id) => entry.name.startsWith(`${runToken(id)}-`))) continue;
 			const path = join(root, entry.name);
 			try {
 				if (Date.now() - statSync(path).mtimeMs < staleMs) continue;

@@ -19,16 +19,55 @@ pi install /path/to/pi-harness-rsi              # registers in settings
 
 ## Commands
 
-| Command | What it does |
+One command, verb first. The verb may be omitted: then the whole line is a
+`start` task.
+
+```
+/rsi <verb> [flags] <args>
+```
+
+| Verb | What it does |
 | --- | --- |
-| `/rsi <task>` | Full loop. Flags: `--domain <name>` `--k <n>` `--mode parallel\|sequential` `--force` `--yes` |
-| `/rsi-probe <task>` | Reference executions + digests only (no editor, no edits) |
-| `/rsi-status [runId]` | Ledger identity `R=4k, P=3k`, USD, fallbacks, diversity, budget usage |
-| `/rsi-watch [--follow] [--lines <n>]` | Live view of the in-flight run: stage, elapsed, USD, latest notes (`--follow` tails until it closes) |
-| `/rsi-stop` | Interrupt the in-flight run before its normal end (see *Interruption* below) |
-| `/rsi-adopt [label] [--yes] [--force] [--run <id>]` | Human gate: apply a composed surface, snapshot library, reflect |
-| `/rsi-revert [domain/slug]` | Restore the previous adopted surface from the library |
-| `/rsi-library [domain]` | Domains, entries, `INDEX.md`, `EXPERIENCE.md` |
+| *(none)* | **State view** — the in-flight run if there is one, otherwise the latest ledger and the exact command to type next. Never calls a model. |
+| `start <task>` | Full loop: probe → propose → probe → compose → probe → select → adopt → reflect. Flags: `--k <n>` `--domain <name>` `--mode parallel\|sequential` `--yes` `--force` |
+| `probe <task>` | Reference executions + digests only (no editor, no edits, no adoption). Flags: `--k <n>` `--domain <name>` |
+| `status [runId]` | The in-flight run, else the latest ledger: identity `R=4k, P=3k`, USD, fallbacks, diversity, budget usage. |
+| `watch [--once] [--lines <n>]` | Live view of the in-flight run: stage, elapsed, USD, latest notes — polls until the run closes. `--once` prints a single snapshot instead. |
+| `stop` | Interrupt the in-flight run before its normal end (see *Interruption* below). |
+| `adopt [label] [--run <id>] [--yes] [--force]` | Human gate: apply a composed surface, snapshot the library, reflect. |
+| `revert <domain>/<slug> [--force]` | Restore the previous adopted surface for one library entry, under the same guards as adoption. Must resolve, else it errors. |
+| `library [domain]` | Domains, entries, `INDEX.md`, `EXPERIENCE.md`. |
+| `help` | The table above, in the terminal. |
+
+`/rsi` with no arguments is the entry point: it prints where things stand and
+what to type next.
+
+**The three commands you actually type** — everything else is for when you want
+to look:
+
+```
+/rsi probe fix the flaky session test                        # 1. what does the harness do today? (no edits)
+/rsi status                                                  #    read the digests, then...
+/rsi start --domain acme run the verifier after every edit    # 2. learn the habit (asks before adopting)
+/rsi                                                          # 3. what next? one exact command
+```
+
+Every command that changes state ends by printing exactly one command to type
+next, so the workflow is discoverable from the terminal (`/rsi` alone) and from
+the end of any run.
+
+**Argument rules** (they are what keep the surface predictable):
+
+- The first word is a verb **only** if it is one of the lowercase verbs above.
+  Anything else is task text, so `/rsi fix the flaky test` means `start`.
+- **Flags come before the task.** Everything from the first task word onward is
+  task text verbatim — `/rsi start --k 2 fix --verbose` has the task
+  `fix --verbose`. (Verbs that take discrete arguments — `adopt`, `status`,
+  `revert` — accept flags anywhere: `/rsi adopt final0 --run <id> --yes`.)
+- `--flag=value` works too, and `--` ends flag parsing when the task itself
+  starts with a dash: `/rsi start -- --verbose is not a flag`.
+- An unknown flag, a value flag with no value, or a value on a boolean is an
+  error with the usage line — never a silent reinterpretation of the task.
 
 Adoption and reflection also maintain the library's health: a new lesson whose
 cue matches an older one **supersedes** it (the old entry stays on disk for
@@ -36,12 +75,20 @@ audit, but stops entering missions), and every rendered lesson carries its
 `adopted:` date so the editor can weigh staleness.
 
 Headless (`pi --print "/rsi …"`) mirrors every report to stdout; adoption stays
-gated — without `--yes` a headless run ends as `outcome: pending` and tells you
-the `/rsi-adopt` command to run next.
+gated — without `--yes` a headless run ends as `outcome: pending` and prints
+the `/rsi adopt …` command to run next. There is no input loop to keep
+responsive, so headless runs **await** the loop instead of detaching it: the
+process exits when the run has actually finished, not while it is still
+starting.
 
-Only one run can be in flight per session: `/rsi`, `/rsi-probe` and
-`/rsi-adopt` refuse while another run is active; `/rsi-watch` inspects the
-in-flight run and `/rsi-stop` interrupts it.
+A `running` ledger whose owner pid (recorded in the ledger, same host) is no
+longer alive is reported as orphaned — `/rsi status` says so and `/rsi watch`
+does not present it as in flight, so a crashed or killed run cannot masquerade
+as a live one.
+
+Only one run can be in flight per project: `start`, `probe` and `adopt` refuse
+while another run is active (in this session or in another process — see the
+run lock); `watch` inspects it and `stop` interrupts it.
 
 ## How to use
 
@@ -59,10 +106,10 @@ task* k times against the current surface in a throwaway worktree and writes
 digests (errors, tool timeline, rework, verifier output). No editor, no edits:
 
 ```
-/rsi-probe fix the flaky session test
+/rsi probe fix the flaky session test
 ```
 
-Read `/rsi-status`. The digests under `.pi/harness/runs/<id>/digests/` tell you
+Read `/rsi status`. The digests under `.pi/harness/runs/<id>/digests/` tell you
 where the harness bleeds: repeated identical calls, failing checks, paths never
 read. That is the input the improvement loop will act on.
 
@@ -71,7 +118,7 @@ capability you want the harness to acquire (it is what the reference executions
 measure):
 
 ```
-/rsi --domain acme-api run the verifier before every edit and re-read files after editing
+/rsi start --domain acme-api run the verifier before every edit and re-read files after editing
 ```
 
 What happens, stage by stage:
@@ -88,25 +135,26 @@ What happens, stage by stage:
    and digests only; labels and “why mine is better” text never reach it.
 6. `adopt` — **the human gate**: pi shows the diff and asks. Confirm to update
    the live tree and write the library snapshot; decline and nothing changes
-   (the candidate stays in `surfaces/` for later `/rsi-adopt`).
+   (the candidate stays in `surfaces/` for later `/rsi adopt`).
 7. `reflect` — one `EXPERIENCE.md` entry (cue / lesson / evidence / confidence,
    caps enforced) so the next run in this domain starts smarter.
 
-**Iterate.** Repeat `/rsi` with a new task in the same domain; each run feeds on
-the previous library (`INDEX.md` + top lessons enter the propose mission, still
-budget-capped). Check or undo with:
+**Iterate.** Repeat `/rsi start` with a new task in the same domain; each run
+feeds on the previous library (`INDEX.md` + top lessons enter the propose
+mission, still budget-capped). Check or undo with:
 
 ```
-/rsi-library acme-api       # domains, INDEX.md, EXPERIENCE.md
-/rsi-revert acme-api <slug> # restore the previous adopted surface
-/rsi-adopt final0 --run <id> # apply a candidate you left pending
+/rsi status                     # latest run + the exact next command
+/rsi library acme-api           # domains, INDEX.md, EXPERIENCE.md
+/rsi adopt final0 --run <id>    # apply a candidate you left pending
+/rsi revert acme-api/<slug>     # restore the previous adopted surface
 ```
 
 **Headless / scripted:**
 
 ```bash
-pi --print "/rsi-probe --domain acme-api $TASK"          # evidence only, silent adoption impossible
-pi --print "/rsi --domain acme-api --yes $TASK"          # explicit opt-out of the gate
+pi --print "/rsi probe --domain acme-api $TASK"          # evidence only, silent adoption impossible
+pi --print "/rsi start --domain acme-api --yes $TASK"    # explicit opt-out of the gate
 ```
 
 **Cost & knobs:** a k=1 run is 4 solver probes + 3 editor sessions (7 child-`pi`
@@ -124,10 +172,10 @@ session. You want the *harness* to learn the habit, not a one-off reminder.
 ```text
 $ cd ~/code/acme-api && pi
 
-▸ /rsi-probe add a rate-limit header to the login endpoint
+▸ /rsi probe add a rate-limit header to the login endpoint
   … 1 reference run, digest in .pi/harness/runs/20261018-121500-add-a-rate-limit/digests/ref0.md
 
-▸ /rsi-status
+▸ /rsi status
   run 20261018-121500-add-a-rate-limit  task: add a rate-limit header to the login endpoint
   ledger: R 1 rollouts (probe-only run — R=4k/P=3k identity does not apply)
   usd: 0.0412 / max 2 (setting)
@@ -147,7 +195,7 @@ $ cd ~/code/acme-api && pi
 
   → the digest shows the real defect: 2 identical greps, 2 failing checks, no re-read.
 
-▸ /rsi --domain acme-api run the verifier after every edit and re-read files before the next edit
+▸ /rsi start --domain acme-api run the verifier after every edit and re-read files before the next edit
   rsi: profile=small k=1 mode=parallel fake=0 maxUsd=2 confirmAdopt=1
   [rsi] final0: # digest: final0 (model=…, 88s, turns=9) — diff 2 file(s) changed
   rsi: adopt final0?
@@ -158,6 +206,7 @@ $ cd ~/code/acme-api && pi
       The live tree is updated and a library snapshot is written.
   ✔ Yes
   rsi: adopted final0 · USD 0.0873 · R 4/4 P 3/3 identity OK
+  /rsi library acme-api
 
 ▸ git status
   M AGENTS.md
@@ -165,18 +214,18 @@ $ cd ~/code/acme-api && pi
   ?? .pi/harness/library/          # your learned experience — version it
                                     # (runs/ and worktrees/ are self-ignored)
 
-▸ /rsi-library acme-api
+▸ /rsi library acme-api
   --- INDEX.md ---
   - **add-a-rate-limit-header** — checks failing after an edit → re-read the edited file and run the verifier before the next edit (2026-10-18)
 ```
 
-Next week, `/rsi --domain acme-api <new task>` loads that lesson into the propose
-mission automatically (cue match), and the new reference digests sit next to the
+Next week, `/rsi start --domain acme-api <new task>` loads that lesson into the
+propose mission automatically (cue match), and the new reference digests sit next to the
 old ones — so whether rework actually went down is measurable, not vibes. If a
 run makes things worse:
 
 ```text
-▸ /rsi-revert acme-api add-a-rate-limit-header
+▸ /rsi revert acme-api/add-a-rate-limit-header
   rsi: restored previous surface for acme-api/add-a-rate-limit-header (AGENTS.md)
 ```
 
@@ -217,7 +266,7 @@ fresh clone starts from zero:
 | Path | Why |
 | --- | --- |
 | `AGENTS.md`, `.pi/skills/`, `.pi/prompts/` | the adopted surface — the habits the harness actually learned |
-| `.pi/harness/library/` | `INDEX.md`, `EXPERIENCE.md`, `surface/`, `previous/` — the experience that seeds the next run and makes `/rsi-revert` work |
+| `.pi/harness/library/` | `INDEX.md`, `EXPERIENCE.md`, `surface/`, `previous/`, `history/` — the experience that seeds the next run and makes `/rsi revert` work |
 | `.pi/settings.json` | the `rsi` config (verifier, budget, profile) so runs are reproducible across machines |
 | `.pi/harness/.gitignore` | optional to commit (it is regenerated anyway); committing it documents the intent |
 
@@ -265,7 +314,7 @@ Profile `large` doubles these (set `rsi.profile`).
     "profile": "small",          // or "large" (doubles every budget below)
     "k": 1,                      // references per domain index (R=4k, P=3k)
     "mode": "parallel",          // or "sequential"
-    "editorModel": null,         // child-pi model overrides (null = inherit)
+    "editorModel": null,         // child-pi model overrides (null = inherit the session's model)
     "solverModel": null,
     "thinking": null,            // child-pi --thinking level, when set
     "tools": "read,bash,edit,write,grep,find,ls",   // solver tool allowlist
@@ -291,28 +340,40 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
 
 ## Safety model
 
-- **P6**: adoption only through the confirm gate (`/rsi-adopt --yes` to opt out
+- **P6**: adoption only through the confirm gate (`/rsi adopt --yes` to opt out
   explicitly); a dirty working tree refuses adoption unless `--force`.
+- **Revert is guarded too**: `/rsi revert <domain>/<slug>` applies the snapshot
+  inside the same transaction as adoption — dirty-tree check (`--force` to
+  override), cross-process run lock, re-validation, and restore-on-throw — so a
+  restore can no longer clobber uncommitted work or race an adoption.
 - **Fail closed**: invalid editor output → one retry carrying the verbatim
   validator error → fallback to the current surface (counted in the ledger).
 - **Fail open** only at selection (judge unavailable → pick `c0`, recorded),
   because refusing selection cannot corrupt a grader.
-- **Interruption**: `/rsi-stop` interrupts the run before its normal end. In
-  the session that owns the run, the current child-`pi` call is SIGTERMed; from
+- **Interruption**: `/rsi stop` interrupts the run before its normal end. In
+  the session that owns the run, the current child-`pi` call — rollout *or*
+  verifier — is SIGTERMed (both run async and are killed as a process tree); from
   another session (headless runs included) it writes a `STOP` sentinel into the
   run dir. Either way the loop checks the stop signal at every stage boundary
   and closes with outcome `aborted` — nothing half-applied, evidence and
-  candidates stay under the run dir, and no adoption happens. `/rsi-watch`
-  (optionally `--follow`) shows the live stage, spend and notes, with a
-  ledger-backed disk view for runs started in another session.
+  candidates stay under the run dir, and no adoption happens. `/rsi watch`
+  shows the live stage, spend and notes (it tails until the run closes; `--once`
+  prints a snapshot), with a ledger-backed disk view for runs started in another
+  session.
+- **Budget check granularity**: `rsi.maxUsd` (and `/rsi stop`) are evaluated at
+  stage boundaries, not mid-rollout, so a stage that already launched its
+  parallel children can overshoot the cap by one stage's spend before the run
+  aborts fail-closed. Crashed children that never report provider cost count as
+  $0 — keep `maxUsd` a real ceiling, not the exact spend.
 - **Retention**: each new run prunes run dirs beyond `rsi.keepRuns` — but only
-  runs that are old *and* decided; anything awaiting `/rsi-adopt` (and the
+  runs that are old *and* decided; anything awaiting `/rsi adopt` (and the
   in-flight run) is never deleted, so the raw evidence a lesson came from
-  stays repairable.
+  stays repairable. `/rsi probe` goes through the same bookkeeping, so it also
+  prunes stale runs/sandboxes even though it edits nothing in the surface.
 - **One run per project (cross-process lock)**: the in-process registry only
   sees this `pi` session, so every run also takes `.pi/harness/run.lock`
   (pid + run id + host). A second session — or a headless `pi --print` — refuses
-  to start while a live lock exists, and `/rsi-adopt` takes the same lock before
+  to start while a live lock exists, and `/rsi adopt` takes the same lock before
   touching the tree. A lock whose pid is dead, is older than 12 h, or is
   unreadable is ignored (fail open), so a crashed run never wedges the project.
 - **Delta-only validation**: `readSurface` snapshots what is already in the
@@ -325,26 +386,43 @@ Environment overrides: `PI_RSI_MAX_USD`, `PI_RSI_PI_BIN` (child binary),
   a dirty tree (only reachable with `--force`) or a non-git project probes a
   byte-faithful copy of the live tree instead, so rollouts always measure the
   surface that was snapshotted rather than a stale checkout.
+- **Sandbox boundary (be precise)**: a probe sandbox isolates the *working
+  files*, not the process. A git-worktree sandbox shares the host repository’s
+  `.git`, so a solver with `bash` can touch refs/config/hooks; a copy sandbox
+  copies the tree, including untracked files (e.g. `.env`). Run untrusted tasks
+  in a container/VM, or point the project at a throwaway clone.
+- **Digest truncation is reported**: when a digest has to drop sections to fit
+  its budget, the run records a `digest … capped` note instead of hiding it.
 - Every run writes `.pi/harness/runs/<id>/`: `ledger.json`, `report.json`,
   `status.txt`, missions, digests, evidence (sessions + rollouts), candidate
   surfaces, `selection.json`. Library: `.pi/harness/library/<domain>/<slug>/`
-  with `EXPERIENCE.md`, `INDEX.md`, `surface/`, `previous/`.
+  with `EXPERIENCE.md`, `INDEX.md`, `surface/`, `previous/` and `history/`
+  (previous snapshots archived on each new adoption; `/rsi revert` restores the
+  most recent `previous/`).
 
 ## Development
 
 ```bash
 bun install          # dev deps (types only)
 bun test             # full suite, includes fake loops for k=1 and k=2 (PI_RSI_FAKE=1)
-bun run typecheck    # tsc --noEmit, strict
+bun run typecheck    # tsc --noEmit, strict + noUncheckedIndexedAccess
 bun run lint         # Biome: lint + format check (bun run format to fix)
-PI_RSI_FAKE=1 pi --offline -ne -e ./index.ts --print "/rsi --domain demo <task>"   # zero-cost e2e
+PI_RSI_FAKE=1 pi --offline -ne -e ./index.ts --print "/rsi start --domain demo <task>"   # zero-cost e2e
 ```
 
-Layout: `index.ts` (commands) · `src/loop.ts` (orchestration) · `src/watch.ts`
-(live run registry: `/rsi-watch`, `/rsi-stop`) · `src/lock.ts` (cross-process
+`src/args.ts` is the whole command surface: `VERBS`, per-verb `FLAGS`, the
+parser and the `HELP` table. Adding a verb means one entry in `VERBS`, one in
+`FLAGS`, one in `HELP`, and one `case` in `index.ts` (whose `default:` branch
+types `verb` as `never`, so a missing `case` is a compile error, not a command
+that silently does nothing); `test/args.test.ts` asserts `HELP` covers every
+verb, so a missing row fails the suite.
+
+Layout: `index.ts` (command dispatch: one `/rsi`, verb-first) · `src/args.ts`
+(verb + flag parsing, help text) · `src/loop.ts` (orchestration) · `src/watch.ts`
+(live run registry: `/rsi watch`, `/rsi stop`) · `src/lock.ts` (cross-process
 run lock) · `src/context.ts` (budget choke point) · `src/surface.ts` (whitelist +
 validation + gate review) · `src/guard.ts` (tripwires/script scan/gates) ·
 `src/trajectory.ts` (digests) · `src/editor.ts` (missions, reply parsing) ·
 `src/selection.ts` · `src/library.ts` (lessons, supersession) · `src/ledger.ts` ·
-`src/probe.ts` · `src/retention.ts` (run pruning) · `src/runs.ts` (run discovery) ·
+`src/probe.ts` · `src/proc.ts` (interruptible child processes: rollouts + verifier) · `src/retention.ts` (run pruning) · `src/runs.ts` (run discovery) ·
 `src/worktree.ts` · `src/fake.ts`.

@@ -11,9 +11,10 @@
  * file is self-ignored via `.pi/harness/.gitignore` (see `ensureHarnessIgnored`).
  */
 
+import { closeSync, openSync, writeSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
-import { ensureDir, readTextIf, rmrf, writeText } from "./util";
+import { ensureDir, readTextIf, rmrf } from "./util";
 
 export interface RunLock {
 	pid: number;
@@ -79,10 +80,10 @@ export interface RefusedLock {
 export class RunLockedError extends Error {
 	readonly holder: RunLock;
 
-	constructor(holder: RunLock) {
+	constructor(holder: RunLock, cwd: string = process.cwd()) {
 		super(
 			`another rsi run (${holder.runId}, pid ${holder.pid}) is in flight in this project — ` +
-				`wait for it, /rsi-stop it, or remove ${lockPath(process.cwd())} if it is stale`,
+				`wait for it, /rsi stop it, or remove ${lockPath(cwd)} if it is stale`,
 		);
 		this.name = "RunLockedError";
 		this.holder = holder;
@@ -90,19 +91,61 @@ export class RunLockedError extends Error {
 }
 
 /**
+ * Create the lock file *exclusively* (`wx` = O_CREAT|O_EXCL).
+ * Returns false when the file already exists, which is the atomic half of
+ * acquisition: the previous check-then-write let two processes both observe a
+ * free lock and both believe they owned it.
+ */
+function createExclusive(path: string, body: string): boolean {
+	try {
+		const fd = openSync(path, "wx");
+		try {
+			writeSync(fd, body);
+		} finally {
+			closeSync(fd);
+		}
+		return true;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw err;
+	}
+}
+
+/**
  * Acquire the run lock for `runId`. Refuses only when a *live* lock exists.
+ *
  * `release()` is idempotent and only removes the lock if this process still
  * owns it (a later run may have taken it after a stale takeover).
  */
 export function acquireRunLock(cwd: string, runId: string): AcquiredLock | RefusedLock {
-	const holder = heldRunLock(cwd);
-	if (holder) return { ok: false, holder };
 	const path = lockPath(cwd);
 	ensureDir(dirname(path));
-	writeText(
-		path,
-		JSON.stringify({ pid: process.pid, runId, startedAt: new Date().toISOString(), host: hostname() }, null, "\t"),
+	const body = JSON.stringify(
+		{ pid: process.pid, runId, startedAt: new Date().toISOString(), host: hostname() },
+		null,
+		"\t",
 	);
+
+	// Fast path: exclusive create wins the race against any concurrent writer.
+	if (!createExclusive(path, body)) {
+		const holder = heldRunLock(cwd);
+		if (holder) return { ok: false, holder };
+		// The existing lock is stale or unreadable: take it over, then re-create
+		// exclusively so two takeovers still cannot both win.
+		rmrf(path);
+		if (!createExclusive(path, body)) {
+			const raced = heldRunLock(cwd);
+			if (raced) return { ok: false, holder: raced };
+			rmrf(path);
+			if (!createExclusive(path, body)) {
+				return {
+					ok: false,
+					holder: readRunLock(cwd) ?? { pid: 0, runId: "unknown", startedAt: new Date(0).toISOString(), host: "?" },
+				};
+			}
+		}
+	}
+
 	let released = false;
 	return {
 		ok: true,

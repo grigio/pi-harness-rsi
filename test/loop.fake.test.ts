@@ -148,7 +148,7 @@ describe("full fake loop (PI_RSI_FAKE=1, zero model calls)", () => {
 		expect(report.usd).toBeLessThanOrEqual(cfg.maxUsd + 0.01);
 	}, 60_000);
 
-	test("/rsi-probe: reference executions only, R=k, identity exempt", async () => {
+	test("/rsi probe: reference executions only, R=k, identity exempt", async () => {
 		const cwd = makeCwd();
 		const report = await runReferenceProbes({
 			cfg: fakeCfg(),

@@ -162,4 +162,16 @@ describe("workingTreeStatus — harness-managed paths are not 'dirty'", () => {
 		writeFileSync(join(cwd, "AGENTS.md"), "# x\n");
 		expect(workingTreeStatus(cwd).dirty).toBe(false);
 	});
+
+	test("a git failure that is not 'not a repo' fails closed", () => {
+		// A corrupt `.git` file makes `git status` error with "invalid gitfile
+		// format". Treating that as clean was fail-open: the dirty-tree gate could
+		// not run, so adoption would proceed over possibly-uncommitted work.
+		const cwd = mkdtempSync(join(tmpdir(), "rsi-badgit-"));
+		writeFileSync(join(cwd, ".git"), "garbage\n");
+		writeFileSync(join(cwd, "AGENTS.md"), "# x\n");
+		const status = workingTreeStatus(cwd);
+		expect(status.dirty).toBe(true);
+		expect(status.error).toBeDefined();
+	});
 });
